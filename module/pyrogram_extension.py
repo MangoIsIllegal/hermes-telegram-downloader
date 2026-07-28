@@ -1036,6 +1036,12 @@ async def report_bot_forward_status(
 
 _report_lock = asyncio.Lock()
 
+# Bot connection error tracking — when consecutive connection errors reach
+# _BOT_RECONNECT_THRESHOLD, bot.py's update_reply_message loop will trigger
+# a bot stop+start reconnect. Reset on successful report.
+_bot_conn_errors = {"count": 0}
+_BOT_RECONNECT_THRESHOLD = 20
+
 # Unified FloodWait cooldown shared across edit_message, download_media,
 # upload, and pending consumer. Any handler that catches FloodWait updates
 # this so all other components know to pause.
@@ -1060,9 +1066,17 @@ async def report_bot_status(
     """see _report_bot_status"""
     try:
         async with _report_lock:
-            return await _report_bot_status(client, node, immediate_reply)
+            result = await _report_bot_status(client, node, immediate_reply)
+        # Success — reset connection error counter
+        _bot_conn_errors["count"] = 0
+        return result
     except Exception as e:
-        logger.debug(f"{e}")
+        err_str = str(e)
+        if "Connection lost" in err_str or "OSError" in err_str or "TimeoutError" in err_str or "socket" in err_str.lower():
+            _bot_conn_errors["count"] += 1
+            logger.warning(f"bot connection error #{_bot_conn_errors['count']}: {e}")
+        else:
+            logger.debug(f"{e}")
 
 
 async def _report_bot_status(

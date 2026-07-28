@@ -235,10 +235,31 @@ class DownloadBot:
 
     async def update_reply_message(self):
         """Update reply message"""
+        _bot_reconnect_cooldown = 300  # 5 min between reconnect attempts
+        _bot_last_reconnect = 0.0
         while self.is_running:
             for key, value in self.task_node.copy().items():
                 if value.is_running:
                     await report_bot_status(self.bot, value)
+
+            # Check if bot connection has degraded — reconnect if too many
+            # consecutive errors and cooldown has passed.
+            from module.pyrogram_extension import _bot_conn_errors, _BOT_RECONNECT_THRESHOLD
+            if _bot_conn_errors["count"] >= _BOT_RECONNECT_THRESHOLD:
+                now = time.time()
+                if now - _bot_last_reconnect >= _bot_reconnect_cooldown:
+                    logger.warning(
+                        f"Bot connection errors reached {_bot_conn_errors['count']} "
+                        f"(threshold {_BOT_RECONNECT_THRESHOLD}) — triggering reconnect"
+                    )
+                    _bot_conn_errors["count"] = 0
+                    _bot_last_reconnect = now
+                    success = await self._reconnect_bot()
+                    if success:
+                        _bot_last_reconnect = now
+                    else:
+                        # Reconnect failed — set shorter cooldown to retry sooner
+                        _bot_last_reconnect = now - _bot_reconnect_cooldown + 60
 
             for key, value in self.task_node.copy().items():
                 if value.is_running and value.is_finish():
@@ -598,6 +619,37 @@ class DownloadBot:
 
         await self.bot.set_bot_commands(commands)
 
+        self._register_bot_handlers()
+
+        try:
+            await send_help_str(self.bot, admin.id)
+        except Exception as e:
+            logger.warning(f"Failed to send help message: {e}")
+
+        self.reply_task = _bot.app.loop.create_task(_bot.update_reply_message())
+
+        # Recover incomplete tasks from previous run
+        _bot.app.loop.create_task(_bot.recover_tasks())
+
+        self.bot.add_handler(
+            MessageHandler(
+                forward_to_comments,
+                filters=pyrogram.filters.command(["forward_to_comments"])
+                & pyrogram.filters.user(self.allowed_user_ids),
+            )
+        )
+
+        # 自动注册频道监听 handler（支持 config.yaml 中的 chat）
+        if self.app.chat_download_config:
+            self._register_listen_handler()
+            logger.info("Auto-registered listen handler for config chats")
+
+    def _register_bot_handlers(self):
+        """Register all bot MessageHandlers and CallbackQueryHandler.
+
+        Called from start() and _reconnect_bot() — stop() clears handlers,
+        so they must be re-registered after every reconnect.
+        """
         self.bot.add_handler(
             MessageHandler(
                 download_from_bot,
@@ -719,16 +771,7 @@ class DownloadBot:
             )
         )
 
-        try:
-            await send_help_str(self.bot, admin.id)
-        except Exception as e:
-            logger.warning(f"Failed to send help message: {e}")
-
-        self.reply_task = _bot.app.loop.create_task(_bot.update_reply_message())
-
-        # Recover incomplete tasks from previous run
-        _bot.app.loop.create_task(_bot.recover_tasks())
-
+        # forward_to_comments handler (registered after reply_task in original start)
         self.bot.add_handler(
             MessageHandler(
                 forward_to_comments,
@@ -737,10 +780,27 @@ class DownloadBot:
             )
         )
 
-        # 自动注册频道监听 handler（支持 config.yaml 中的 chat）
-        if self.app.chat_download_config:
-            self._register_listen_handler()
-            logger.info("Auto-registered listen handler for config chats")
+    async def _reconnect_bot(self):
+        """Stop and restart the bot client to recover from persistent connection loss.
+
+        Uses the existing session file — no re-authentication needed.
+        Returns True if reconnect succeeded, False otherwise.
+        """
+        try:
+            logger.warning("Attempting bot reconnect: stop()...")
+            await self.bot.stop()
+        except Exception as e:
+            logger.warning(f"bot.stop() during reconnect failed (continuing): {e}")
+
+        try:
+            logger.warning("Attempting bot reconnect: start()...")
+            await self.bot.start()
+            self._register_bot_handlers()
+            logger.success("Bot reconnected successfully — handlers re-registered")
+            return True
+        except Exception as e:
+            logger.error(f"bot.start() during reconnect failed: {e}")
+            return False
 
 
 _bot = DownloadBot()
