@@ -50,6 +50,21 @@ app = Application(CONFIG_NAME, DATA_FILE_NAME, APPLICATION_NAME)
 queue: asyncio.Queue = None  # Created in main() after event loop starts
 RETRY_TIME_OUT = 3
 
+# ── Client connection error tracking & auto-reconnect ──
+# When download_media hits connection-level errors (TimeoutError, OSError,
+# FILE_REFERENCE_EXPIRED) consecutively, the Pyrogram session's underlying
+# TCP connection is likely in a "half-dead" state — socket is alive but
+# no data flows. Pyrogram's internal retry (3x) uses the same dead socket,
+# so all retries fail. Auto-reconnect forces client.stop()+start() to build
+# a fresh TCP connection + MTProto session, mirroring the manual fix of
+# toggling the v2rayA node.
+_client_conn_errors = {"count": 0}
+_CLIENT_RECONNECT_THRESHOLD = 10
+_client_reconnecting = {"active": False}
+_client_last_reconnect = {"time": 0.0}
+_CLIENT_RECONNECT_COOLDOWN = 300  # 5 min between reconnect attempts
+_main_client_ref = {"client": None}  # set in start_server()
+
 logging.getLogger("pyrogram.session.session").addFilter(LogFilter())
 logging.getLogger("pyrogram.client").addFilter(LogFilter())
 
@@ -466,6 +481,7 @@ async def download_media(
                         os.remove(bak_path)
                     except OSError:
                         pass
+                _client_conn_errors["count"] = 0  # Reset on success
                 return DownloadStatus.SuccessDownload, file_name, ""
             else:
                 # download_media returned None or non-str — Pyrogram couldn't fetch
@@ -492,6 +508,9 @@ async def download_media(
                 f"Message[{message.id}]: {_t('file reference expired, refetching')}..."
             )
             error_message = "文件引用过期"
+            _client_conn_errors["count"] += 1
+            if await _maybe_reconnect_client():
+                error_message = "文件引用过期（触发客户端重连）"
             await asyncio.sleep(RETRY_TIME_OUT)
             message = await fetch_message(client, message)
             if _check_timeout(retry, message.id):
@@ -562,6 +581,9 @@ async def download_media(
             from module.pyrogram_extension import _unified_flood_wait
             _unified_flood_wait["until"] = time.time() + backoff + 5
             _unified_flood_wait["reason"] = f"连接超时疑似限速 (msg {message.id})"
+            _client_conn_errors["count"] += 1
+            if await _maybe_reconnect_client():
+                backoff = 5  # Short backoff after reconnect
             # 第一次超时就通知用户
             if retry == 0 and node and node.bot and getattr(node, "from_user_id", ""):
                 try:
@@ -596,6 +618,9 @@ async def download_media(
             else:
                 # 普通连接错误，保持原有指数退避：10s, 20s, 40s
                 backoff = 10 * (2 ** retry)
+            _client_conn_errors["count"] += 1
+            if await _maybe_reconnect_client():
+                backoff = 5  # Short backoff after reconnect
             logger.warning(
                 f"Message[{message.id}] {ui_file_name}: connection error ({type(e).__name__}), "
                 f"retry {retry + 1}/3 after {backoff}s backoff"
@@ -816,7 +841,72 @@ def _exec_loop():
 
 async def start_server(client: pyrogram.Client):
     """Start the server"""
+    _main_client_ref["client"] = client
     await client.start()
+
+
+async def _reconnect_client():
+    """Force-reconnect the main Pyrogram client to recover from half-dead TCP sessions.
+
+    Mirrors the manual fix of toggling the v2rayA node: client.stop() kills
+    the stale TCP connection, client.start() builds a fresh one using the
+    existing session file (no re-auth needed).
+    """
+    client = _main_client_ref["client"]
+    if client is None:
+        logger.error("Cannot reconnect: no client reference")
+        return False
+
+    _client_reconnecting["active"] = True
+    try:
+        logger.warning("Client auto-reconnect: stop()...")
+        await client.stop()
+    except Exception as e:
+        logger.warning(f"client.stop() during reconnect failed (continuing): {e}")
+
+    try:
+        logger.warning("Client auto-reconnect: start()...")
+        await client.start()
+        logger.success("Client reconnected successfully — fresh TCP session established")
+        _client_conn_errors["count"] = 0
+        return True
+    except Exception as e:
+        logger.error(f"client.start() during reconnect failed: {e}")
+        return False
+    finally:
+        _client_reconnecting["active"] = False
+
+
+async def _maybe_reconnect_client():
+    """Check if consecutive connection errors warrant a client reconnect.
+
+    Called from download_media error handlers. Returns True if reconnect was
+    triggered (caller should abort current download), False otherwise.
+    """
+    if _client_conn_errors["count"] < _CLIENT_RECONNECT_THRESHOLD:
+        return False
+
+    if _client_reconnecting["active"]:
+        logger.debug("Reconnect already in progress, skipping")
+        return True
+
+    now = time.time()
+    if now - _client_last_reconnect["time"] < _CLIENT_RECONNECT_COOLDOWN:
+        logger.debug(
+            f"Reconnect cooldown active ({int(_CLIENT_RECONNECT_COOLDOWN - (now - _client_last_reconnect['time']))}s remaining), skipping"
+        )
+        return True
+
+    logger.warning(
+        f"Client connection errors reached {_client_conn_errors['count']} "
+        f"(threshold {_CLIENT_RECONNECT_THRESHOLD}) — triggering auto-reconnect"
+    )
+    _client_last_reconnect["time"] = now
+    success = await _reconnect_client()
+    if not success:
+        # Reconnect failed — retry sooner (60s instead of full cooldown)
+        _client_last_reconnect["time"] = now - _CLIENT_RECONNECT_COOLDOWN + 60
+    return True
 
 
 async def stop_server(client: pyrogram.Client):
