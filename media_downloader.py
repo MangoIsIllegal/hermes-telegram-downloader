@@ -924,12 +924,18 @@ async def _reconnect_client():
             await asyncio.wait_for(client.stop(), timeout=30)
         except asyncio.TimeoutError:
             logger.error("client.stop() timed out after 30s, force disconnect")
+            # stop() = terminate() + disconnect()，超时说明某一步 hang 了
+            # 手动清理 Pyrogram 内部状态，否则 start() 会报 "already connected"
             try:
                 await client.disconnect()
             except Exception:
                 pass
+            # 强制重置连接标志 — disconnect() 可能因 is_initialized=True 而失败，
+            # 但我们需要让 start()→connect() 能重新建立连接
+            client.is_connected = False
         except Exception as e:
             logger.warning(f"client.stop() during reconnect failed (continuing): {e}")
+            client.is_connected = False
 
         # start() 加 30s 超时 — 防止 start() 在未清理干净的 session 上 hang
         logger.warning("Client auto-reconnect: start()...")

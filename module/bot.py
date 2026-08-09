@@ -799,10 +799,13 @@ class DownloadBot:
                     await self.bot.disconnect()
                 except Exception:
                     pass
+                self.bot.is_connected = False
             except Exception as e:
                 logger.warning(f"bot.stop() during reconnect failed (continuing): {e}")
+                self.bot.is_connected = False
         except Exception as e:
             logger.warning(f"bot.stop() outer error (continuing): {e}")
+            self.bot.is_connected = False
 
         try:
             logger.warning("Attempting bot reconnect: start()...")
