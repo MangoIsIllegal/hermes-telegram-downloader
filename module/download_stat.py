@@ -30,6 +30,11 @@ _failed_downloads: list = []
 _chat_titles: dict = {}  # chat_id -> chat_title mapping
 _download_lock: asyncio.Lock = asyncio.Lock()  # 保护 _download_result / _total_download_speed / _failed_downloads 等全局变量的并发访问
 
+# 任务进度心跳 — 每次 Pyrogram 进度回调更新，worker watchdog 检测长时间无进度
+# 只杀"死任务"（连接断了，无任何数据回调），不杀"慢任务"（有回调但在慢下载）
+_task_heartbeat: dict = {}  # composite_key → last progress timestamp
+_TASK_HEARTBEAT_TIMEOUT = 300  # 5 分钟无进度回调判定为死连接
+
 # 静默限速检测状态机
 # IDLE(since=0,notified=False) → 速度<阈值 → SLOW_PENDING(since=T,notified=False)
 # SLOW_PENDING → 持续120s → THROTTLED(发TG通知) | 速度恢复 → IDLE(静默)
@@ -102,6 +107,19 @@ def set_download_state(state: DownloadState):
 def is_task_paused(task_id) -> bool:
     """Check if a specific task is paused"""
     return str(task_id) in _paused_tasks
+
+
+def clear_task_heartbeat(composite_key: str):
+    """清除任务心跳记录（任务完成/失败/取消时调用）"""
+    _task_heartbeat.pop(composite_key, None)
+
+
+def get_task_heartbeat_age(composite_key: str) -> float:
+    """返回任务距上次进度回调的秒数。无记录返回 -1。"""
+    ts = _task_heartbeat.get(composite_key)
+    if ts is None:
+        return -1
+    return time.time() - ts
 
 
 def pause_task(task_id) -> bool:
@@ -306,6 +324,9 @@ async def update_download_status(
             client.stop_transmission()
         await asyncio.sleep(1)
 
+    # 更新进度心跳 — worker watchdog 用这个检测死连接
+    _task_heartbeat[composite_key] = cur_time
+
     async with _download_lock:
         if not _download_result.get(chat_id):
             _download_result[chat_id] = {}
@@ -421,6 +442,15 @@ async def update_download_status(
 
     # === 静默限速通知（锁外发送，避免 await 阻塞锁）===
     if _throttle_action == "notify" and node.bot and getattr(node, "from_user_id", ""):
+        # 静默限速检测到 — 打通重连机制：递增错误计数并触发 client 重连
+        # 不中断当前下载（让 Pyrogram 继续尝试），但如果连接确实死了，
+        # 后续 TimeoutError 会走 download_media 的 except handler 正常重试
+        try:
+            from media_downloader import _client_conn_errors, _maybe_reconnect_client
+            _client_conn_errors["count"] += 3  # 加速触发重连（阈值10，+3 比每次+1快）
+            asyncio.create_task(_maybe_reconnect_client())
+        except Exception:
+            pass
         try:
             await node.bot.send_message(
                 int(node.from_user_id),

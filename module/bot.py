@@ -785,16 +785,32 @@ class DownloadBot:
 
         Uses the existing session file — no re-authentication needed.
         Returns True if reconnect succeeded, False otherwise.
+
+        所有操作加 asyncio.wait_for 超时，防止 stop()/start() 在半死 TCP 上 hang
+        导致 update_reply_message 循环永久阻塞、所有进度报告停止。
         """
         try:
             logger.warning("Attempting bot reconnect: stop()...")
-            await self.bot.stop()
+            try:
+                await asyncio.wait_for(self.bot.stop(), timeout=30)
+            except asyncio.TimeoutError:
+                logger.error("bot.stop() timed out after 30s, force disconnect")
+                try:
+                    await self.bot.disconnect()
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning(f"bot.stop() during reconnect failed (continuing): {e}")
         except Exception as e:
-            logger.warning(f"bot.stop() during reconnect failed (continuing): {e}")
+            logger.warning(f"bot.stop() outer error (continuing): {e}")
 
         try:
             logger.warning("Attempting bot reconnect: start()...")
-            await self.bot.start()
+            try:
+                await asyncio.wait_for(self.bot.start(), timeout=30)
+            except asyncio.TimeoutError:
+                logger.error("bot.start() timed out after 30s, reconnect failed")
+                return False
             self._register_bot_handlers()
             logger.success("Bot reconnected successfully — handlers re-registered")
             return True
@@ -802,6 +818,9 @@ class DownloadBot:
             logger.error(f"bot.start() during reconnect failed: {e}")
             return False
 
+
+# pending consumer 连续超时计数 — 超过3次标失败，避免无限循环
+_pending_timeout_counts: dict = {}
 
 _bot = DownloadBot()
 
@@ -2014,21 +2033,47 @@ async def _consume_one_pending():
                     msg = await asyncio.wait_for(client.get_messages(cid, int(msg_id)), timeout=300)
                 except asyncio.TimeoutError:
                     # TG 静默限速：get_messages 300s 超时
-                    # 不标失败，保持 pending，设 cooldown 让所有组件暂停
-                    backoff = 60
+                    # 连续超时计数 — 超过3次标失败，不再无限循环
+                    _pending_timeout_counts[task_id] = _pending_timeout_counts.get(task_id, 0) + 1
+                    consecutive = _pending_timeout_counts[task_id]
                     from module.pyrogram_extension import _unified_flood_wait
+                    if consecutive >= 3:
+                        # 连续3次超时（共~15分钟），连接已死，标失败
+                        logger.error(
+                            f"Pending consumer: get_messages TIMEOUT (300s) x{consecutive} for "
+                            f"chat {cid} msg {msg_id}, marking as FAILED"
+                        )
+                        _pending_timeout_counts.pop(task_id, None)
+                        try:
+                            from module.download_stat import add_failed_download
+                            add_failed_download(
+                                chat_id=cid, msg_id=msg_id,
+                                task_id=extra.get('task_id_display', str(task_id)),
+                                file_name="", error_message="获取消息超时（连续3次300s超时，连接已死）",
+                                total_size=0, source_link="",
+                                from_user_id=str(from_user_id) if from_user_id else "",
+                            )
+                        except Exception:
+                            pass
+                        remove_task(task_id)
+                        # 触发 client 重连 — 连续超时说明 TCP 已死
+                        from media_downloader import _maybe_reconnect_client
+                        asyncio.create_task(_maybe_reconnect_client())
+                        return
+                    # 未达3次，保持 pending，设递增 cooldown
+                    backoff = 60 * consecutive  # 60s, 120s, 180s
                     _unified_flood_wait["until"] = time.time() + backoff + 5
-                    _unified_flood_wait["reason"] = f"get_messages 超时疑似限速 chat {cid} msg {msg_id}"
+                    _unified_flood_wait["reason"] = f"get_messages 超时疑似限速 chat {cid} msg {msg_id} (第{consecutive}次)"
                     logger.warning(
                         f"Pending consumer: get_messages TIMEOUT (300s) for chat {cid} msg {msg_id}, "
-                        f"setting {backoff}s cooldown. Task stays pending."
+                        f"setting {backoff}s cooldown. Task stays pending (consecutive timeout #{consecutive})."
                     )
                     if from_user_id and _bot and _bot.bot:
                         try:
                             notify_text = (
                                 "⏸️ TG 连接超时，疑似限速\n"
                                 f"任务: {extra.get('task_id_display', str(task_id))} 保持待执行\n"
-                                f"暂停 {backoff} 秒后自动重试\n"
+                                f"暂停 {backoff} 秒后自动重试（第{consecutive}次超时）\n"
                                 f"原因: get_messages 300s 超时"
                             )
                             await _bot.bot.send_message(int(from_user_id), notify_text)
@@ -2061,14 +2106,34 @@ async def _consume_one_pending():
                 except Exception as e:
                     # 防御性检测：如果异常是 TimeoutError 类型，按限速处理
                     if isinstance(e, TimeoutError):
-                        backoff = 60
+                        _pending_timeout_counts[task_id] = _pending_timeout_counts.get(task_id, 0) + 1
+                        consecutive = _pending_timeout_counts[task_id]
+                        backoff = 60 * consecutive
                         from module.pyrogram_extension import _unified_flood_wait
                         _unified_flood_wait["until"] = time.time() + backoff + 5
-                        _unified_flood_wait["reason"] = f"get_messages 连接超时疑似限速 chat {cid} msg {msg_id}"
+                        _unified_flood_wait["reason"] = f"get_messages 连接超时疑似限速 chat {cid} msg {msg_id} (第{consecutive}次)"
                         logger.warning(
                             f"Pending consumer: TimeoutError for chat {cid} msg {msg_id}: {e}, "
-                            f"setting {backoff}s cooldown. Task stays pending."
+                            f"setting {backoff}s cooldown. Task stays pending (consecutive #{consecutive})."
                         )
+                        if consecutive >= 3:
+                            # 连续3次超时，标失败并触发重连
+                            logger.error(f"Pending consumer: TimeoutError x{consecutive}, marking FAILED")
+                            _pending_timeout_counts.pop(task_id, None)
+                            try:
+                                from module.download_stat import add_failed_download
+                                add_failed_download(
+                                    chat_id=cid, msg_id=msg_id,
+                                    task_id=extra.get('task_id_display', str(task_id)),
+                                    file_name="", error_message=f"获取消息超时（连续{consecutive}次超时）",
+                                    total_size=0, source_link="",
+                                    from_user_id=str(from_user_id) if from_user_id else "",
+                                )
+                            except Exception:
+                                pass
+                            remove_task(task_id)
+                            from media_downloader import _maybe_reconnect_client
+                            asyncio.create_task(_maybe_reconnect_client())
                         return  # 保持 pending，不 remove_task
                     logger.warning(f"Pending consumer: get_messages failed for chat {cid} msg {msg_id}: {e}, moving to failed")
                     try:
@@ -2092,6 +2157,8 @@ async def _consume_one_pending():
                 logger.warning(f"Pending consumer: msg {msg_id} not found in chat {cid}, removing")
                 remove_task(task_id)
                 return
+            # get_messages 成功 — 清除连续超时计数
+            _pending_timeout_counts.pop(task_id, None)
         finally:
             _bot._consuming.discard(task_id)
         node = _bot.task_node.get(int(task_id)) if str(task_id).isdigit() else _bot.task_node.get(task_id)

@@ -1362,10 +1362,17 @@ async def fetch_message(client: pyrogram.Client, message: pyrogram.types.Message
         message (pyrogram.types.Message): A message instance returned from Pyrogram.
      Returns:
         pyrogram.types.Message: A message object retrieved from the specified chat.
+
+    加 60s 超时保护 — 半死 TCP 上 get_messages 会 hang TCP.TIMEOUT(900s)，
+    导致 download_media 重试循环永久阻塞、worker 被永久占用。
+    正常 get_messages 1-2 秒返回，60s 超时极其宽松。
     """
-    return await client.get_messages(
-        chat_id=message.chat.id,
-        message_ids=message.id,
+    return await asyncio.wait_for(
+        client.get_messages(
+            chat_id=message.chat.id,
+            message_ids=message.id,
+        ),
+        timeout=60,
     )
 
 

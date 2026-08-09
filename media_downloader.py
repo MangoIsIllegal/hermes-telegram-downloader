@@ -719,7 +719,16 @@ def _check_config() -> bool:
 
 
 async def worker(client: pyrogram.client.Client):
-    """Work for download task"""
+    """Work for download task
+
+    进度心跳机制：download_task 在独立 Task 中执行，watchdog 每 30s 检查
+    _task_heartbeat。如果某任务超过 _TASK_HEARTBEAT_TIMEOUT(300s) 没有任何
+    Pyrogram 进度回调，说明连接已死（不是慢），cancel 该任务释放 worker。
+    慢下载（有进度回调）不受影响。
+    """
+    from module.download_stat import (
+        _TASK_HEARTBEAT_TIMEOUT, get_task_heartbeat_age, clear_task_heartbeat,
+    )
     while app.is_running:
         try:
             logger.info(f"Worker waiting for queue item...")
@@ -734,10 +743,42 @@ async def worker(client: pyrogram.client.Client):
                 update_download_state(node.task_id, "downloading")
             if node.is_stop_transmission:
                 continue
-            if node.client:
-                await download_task(node.client, message, node)
-            else:
-                await download_task(client, message, node)
+
+            target_client = node.client if node.client else client
+            composite_key = f"{node.chat_id}_{message.id}"
+
+            # 用 Task 包裹 download_task，配合心跳 watchdog 检测死连接
+            dl_task = asyncio.create_task(
+                download_task(target_client, message, node)
+            )
+            watchdog_triggered = False
+            try:
+                while not dl_task.done():
+                    await asyncio.sleep(30)  # 每 30s 检查一次心跳
+                    if dl_task.done():
+                        break
+                    age = get_task_heartbeat_age(composite_key)
+                    if age > _TASK_HEARTBEAT_TIMEOUT:
+                        logger.error(
+                            f"Worker: task {node.task_id_display} (msg {message.id}) "
+                            f"no progress for {int(age)}s (>{_TASK_HEARTBEAT_TIMEOUT}s), "
+                            f"cancelling — likely dead TCP connection"
+                        )
+                        dl_task.cancel()
+                        watchdog_triggered = True
+                        break
+                # 等待 dl_task 完成（正常结束或 cancel）
+                await dl_task
+            except asyncio.CancelledError:
+                # dl_task 被 cancel 时 await 会抛 CancelledError
+                if watchdog_triggered:
+                    logger.warning(
+                        f"Worker: task {node.task_id_display} cancelled by heartbeat watchdog"
+                    )
+                else:
+                    raise
+            finally:
+                clear_task_heartbeat(composite_key)
         except Exception as e:
             logger.exception(f"{e}")
 
@@ -751,9 +792,19 @@ async def download_chat_task(client: pyrogram.Client, chat_download_config: Chat
     chat_download_config.node = node
     if chat_download_config.ids_to_retry:
         logger.info(f"{_t('Downloading files failed during last run')}...")
-        skipped_messages: list = await client.get_messages(
-            chat_id=node.chat_id, message_ids=chat_download_config.ids_to_retry
-        )
+        try:
+            skipped_messages: list = await asyncio.wait_for(
+                client.get_messages(
+                    chat_id=node.chat_id, message_ids=chat_download_config.ids_to_retry
+                ),
+                timeout=120,  # 批量获取加 120s 超时，防止半死 TCP 上 hang 15分钟
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                f"download_chat_task: get_messages timeout (120s) for {len(chat_download_config.ids_to_retry)} "
+                f"retry messages in chat {node.chat_id}, skipping retry this run"
+            )
+            skipped_messages = []
         for message in skipped_messages:
             await add_download_task(message, node)
     async for message in messages_iter:
@@ -851,6 +902,9 @@ async def _reconnect_client():
     Mirrors the manual fix of toggling the v2rayA node: client.stop() kills
     the stale TCP connection, client.start() builds a fresh one using the
     existing session file (no re-auth needed).
+
+    所有操作都加 asyncio.wait_for 超时，防止 stop()/start() 在半死 TCP 上 hang
+    15分钟（TCP.TIMEOUT=900s）导致 _client_reconnecting["active"] 永久锁死。
     """
     client = _main_client_ref["client"]
     if client is None:
@@ -859,20 +913,32 @@ async def _reconnect_client():
 
     _client_reconnecting["active"] = True
     try:
+        # stop() 加 30s 超时 — 半死 TCP 上 stop() 会等 TCP.TIMEOUT(900s)
         logger.warning("Client auto-reconnect: stop()...")
-        await client.stop()
-    except Exception as e:
-        logger.warning(f"client.stop() during reconnect failed (continuing): {e}")
+        try:
+            await asyncio.wait_for(client.stop(), timeout=30)
+        except asyncio.TimeoutError:
+            logger.error("client.stop() timed out after 30s, force disconnect")
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"client.stop() during reconnect failed (continuing): {e}")
 
-    try:
+        # start() 加 30s 超时 — 防止 start() 在未清理干净的 session 上 hang
         logger.warning("Client auto-reconnect: start()...")
-        await client.start()
-        logger.success("Client reconnected successfully — fresh TCP session established")
-        _client_conn_errors["count"] = 0
-        return True
-    except Exception as e:
-        logger.error(f"client.start() during reconnect failed: {e}")
-        return False
+        try:
+            await asyncio.wait_for(client.start(), timeout=30)
+            logger.success("Client reconnected successfully — fresh TCP session established")
+            _client_conn_errors["count"] = 0
+            return True
+        except asyncio.TimeoutError:
+            logger.error("client.start() timed out after 30s, reconnect failed")
+            return False
+        except Exception as e:
+            logger.error(f"client.start() during reconnect failed: {e}")
+            return False
     finally:
         _client_reconnecting["active"] = False
 
