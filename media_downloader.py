@@ -775,6 +775,11 @@ async def worker(client: pyrogram.client.Client):
                     logger.warning(
                         f"Worker: task {node.task_id_display} cancelled by heartbeat watchdog"
                     )
+                    # 心跳超时说明 TCP 连接已死，递增错误计数并触发重连
+                    # 不走 download_media 的 except handler（cancel 是外部杀的），
+                    # 所以必须在这里手动触发，否则重连永远不会被激活
+                    _client_conn_errors["count"] += 3
+                    asyncio.create_task(_maybe_reconnect_client())
                 else:
                     raise
             finally:
