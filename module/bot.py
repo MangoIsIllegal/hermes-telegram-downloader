@@ -2172,7 +2172,27 @@ async def _consume_one_pending():
                     remove_task(task_id)
                     return
             if not msg or msg.empty:
-                logger.warning(f"Pending consumer: msg {msg_id} not found in chat {cid}, removing")
+                logger.warning(f"Pending consumer: msg {msg_id} not found in chat {cid}, moving to failed")
+                try:
+                    from module.download_stat import add_failed_download
+                    task_id_display = extra.get("task_id_display", str(task_id))
+                    source_link = ""
+                    if extra.get("source_chat_id") and extra.get("source_message_id"):
+                        sid = extra["source_chat_id"]
+                        link_id = str(sid)[4:] if str(sid).startswith("-100") else str(sid)
+                        source_link = f"https://t.me/c/{link_id}/{extra['source_message_id']}"
+                    add_failed_download(
+                        chat_id=cid,
+                        msg_id=msg_id,
+                        task_id=task_id_display,
+                        file_name="",
+                        error_message="消息不存在或已被删除",
+                        total_size=0,
+                        source_link=source_link,
+                        from_user_id=str(from_user_id) if from_user_id else "",
+                    )
+                except Exception:
+                    pass
                 remove_task(task_id)
                 return
             # get_messages 成功 — 清除连续超时计数
