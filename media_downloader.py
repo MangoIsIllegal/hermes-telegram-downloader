@@ -333,7 +333,7 @@ async def download_task(client: pyrogram.Client, message: pyrogram.types.Message
                 source_link = f"https://t.me/c/{link_id}/{message.id}"
         _add_failed_download(
             chat_id=node.chat_id,
-            msg_id=message.id,
+            msg_id=message.id if message else message_id,
             task_id=task_id_display,
             file_name=file_name or "",
             error_message=error_message or "下载失败",
@@ -343,11 +343,11 @@ async def download_task(client: pyrogram.Client, message: pyrogram.types.Message
         )
         # Remove from active download list so it doesn't stay in WebUI forever
         from module.download_stat import delete_download_result_entry as _ddre
-        _ddre(node.chat_id, message.id)
+        _ddre(node.chat_id, message.id if message else message_id)
     elif download_status is DownloadStatus.SkipDownload:
         # Remove placeholder from active download list
         from module.download_stat import delete_download_result_entry as _ddre
-        _ddre(node.chat_id, message.id)
+        _ddre(node.chat_id, message.id if message else message_id)
     await upload_telegram_chat(
         client, node.upload_user if node.upload_user else client,
         app, node, message, download_status, file_name,
@@ -495,6 +495,10 @@ async def download_media(
                 error_message = reason
                 await asyncio.sleep(RETRY_TIME_OUT)
                 message = await fetch_message(client, message)
+                if message is None:
+                    logger.error(f"Message[{message_id}] {ui_file_name}: fetch_message returned None, message may be deleted")
+                    error_message = "消息不存在或已被删除"
+                    break
                 if _check_timeout(retry, message.id):
                     logger.error(
                         f"Message[{message.id}] {ui_file_name}: "
@@ -513,6 +517,10 @@ async def download_media(
                 error_message = "文件引用过期（触发客户端重连）"
             await asyncio.sleep(RETRY_TIME_OUT)
             message = await fetch_message(client, message)
+            if message is None:
+                logger.error(f"Message[{message_id}] {ui_file_name}: fetch_message returned None (file ref expired), message may be deleted")
+                error_message = "消息不存在或已被删除（文件引用过期）"
+                break
             if _check_timeout(retry, message.id):
                 logger.error(
                     f"Message[{message.id}]: {_t('file reference expired for 3 retries, download skipped.')}"
@@ -628,6 +636,10 @@ async def download_media(
             error_message = f"连接错误: {str(e)[:80]}"
             await asyncio.sleep(backoff)
             message = await fetch_message(client, message)
+            if message is None:
+                logger.error(f"Message[{message_id}] {ui_file_name}: fetch_message returned None after connection error")
+                error_message = "连接错误后消息不可用"
+                break
             if _check_timeout(retry, message.id):
                 logger.error(
                     f"Message[{message.id}] {ui_file_name}: connection failed after 3 retries"
@@ -647,6 +659,10 @@ async def download_media(
                 error_message = "文件引用过期，正在刷新消息"
                 await asyncio.sleep(RETRY_TIME_OUT)
                 message = await fetch_message(client, message)
+                if message is None:
+                    logger.error(f"Message[{message_id}] {ui_file_name}: fetch_message returned None (stale file ref)")
+                    error_message = "文件引用过期且消息不可用"
+                    break
                 if _check_timeout(retry, message.id):
                     logger.error(
                         f"Message[{message.id}] {ui_file_name}: "
@@ -751,6 +767,8 @@ async def worker(client: pyrogram.client.Client):
             dl_task = asyncio.create_task(
                 download_task(target_client, message, node)
             )
+            dl_task_start = time.time()
+            _MAX_TASK_RUNTIME = 1800  # 30分钟最大运行时间（心跳从未设置时的后备超时）
             watchdog_triggered = False
             try:
                 while not dl_task.done():
@@ -758,7 +776,8 @@ async def worker(client: pyrogram.client.Client):
                     if dl_task.done():
                         break
                     age = get_task_heartbeat_age(composite_key)
-                    if age > _TASK_HEARTBEAT_TIMEOUT:
+                    runtime = time.time() - dl_task_start
+                    if age > _TASK_HEARTBEAT_TIMEOUT or (age < 0 and runtime > _MAX_TASK_RUNTIME):
                         logger.error(
                             f"Worker: task {node.task_id_display} (msg {message.id}) "
                             f"no progress for {int(age)}s (>{_TASK_HEARTBEAT_TIMEOUT}s), "
@@ -780,12 +799,30 @@ async def worker(client: pyrogram.client.Client):
                     # 所以必须在这里手动触发，否则重连永远不会被激活
                     _client_conn_errors["count"] += 3
                     asyncio.create_task(_maybe_reconnect_client())
+                    # watchdog cancel 跳过了 download_media 的 except handler，
+                    # 必须在这里清理任务，否则永久卡在 downloading
+                    try:
+                        from module.task_store import complete_task as _wct
+                        if node and node.task_id:
+                            _wct(node.task_id)
+                            logger.info(f"Worker: force-completed task {node.task_id_display} after watchdog cancel")
+                    except Exception:
+                        pass
                 else:
                     raise
             finally:
                 clear_task_heartbeat(composite_key)
         except Exception as e:
-            logger.exception(f"{e}")
+            logger.exception(f"Worker exception for task {getattr(node, 'task_id_display', '?')}: {e}")
+            # 防止幽灵任务：任何异常退出都必须清理任务状态，
+            # 否则 download_state 永远 "downloading"，并发守卫永久阻塞
+            try:
+                from module.task_store import complete_task as _ct
+                if node and node.task_id:
+                    _ct(node.task_id)
+                    logger.info(f"Worker: force-completed task {node.task_id_display} after exception")
+            except Exception:
+                pass
 
 
 async def download_chat_task(client: pyrogram.Client, chat_download_config: ChatDownloadConfig, node: TaskNode):
