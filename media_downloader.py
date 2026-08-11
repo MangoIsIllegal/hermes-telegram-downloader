@@ -802,7 +802,7 @@ async def worker(client: pyrogram.client.Client):
                     # watchdog cancel 跳过了 download_media 的 except handler，
                     # 移到失败列表而非直接删除，方便手动确认
                     try:
-                        from module.download_stat import add_failed_download
+                        from module.download_stat import add_failed_download, delete_download_result_entry as _ddre
                         from module.task_store import complete_task as _wct
                         if node and node.task_id:
                             msg_id = message.id if message else 0
@@ -821,6 +821,7 @@ async def worker(client: pyrogram.client.Client):
                                 source_link=source_link,
                                 from_user_id=str(getattr(node, "from_user_id", "")) or "",
                             )
+                            _ddre(node.chat_id, msg_id)
                             _wct(node.task_id)
                             logger.info(f"Worker: moved task {node.task_id_display} to failed after watchdog cancel")
                     except Exception:
@@ -833,7 +834,7 @@ async def worker(client: pyrogram.client.Client):
             logger.exception(f"Worker exception for task {getattr(node, 'task_id_display', '?')}: {e}")
             # 防止幽灵任务：任何异常退出都移到失败列表，方便手动确认
             try:
-                from module.download_stat import add_failed_download
+                from module.download_stat import add_failed_download, delete_download_result_entry as _ddre
                 from module.task_store import complete_task as _ct
                 if node and node.task_id:
                     msg_id = message.id if message else 0
@@ -852,6 +853,7 @@ async def worker(client: pyrogram.client.Client):
                         source_link=source_link,
                         from_user_id=str(getattr(node, "from_user_id", "")) or "",
                     )
+                    _ddre(node.chat_id, msg_id)
                     _ct(node.task_id)
                     logger.info(f"Worker: moved task {node.task_id_display} to failed after exception")
             except Exception:
