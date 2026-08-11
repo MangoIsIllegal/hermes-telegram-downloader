@@ -798,7 +798,7 @@ async def worker(client: pyrogram.client.Client):
                     # 不走 download_media 的 except handler（cancel 是外部杀的），
                     # 所以必须在这里手动触发，否则重连永远不会被激活
                     _client_conn_errors["count"] += 3
-                    asyncio.create_task(_maybe_reconnect_client())
+                    asyncio.create_task(_maybe_reconnect_client(force=True))
                     # watchdog cancel 跳过了 download_media 的 except handler，
                     # 移到失败列表而非直接删除，方便手动确认
                     try:
@@ -1079,13 +1079,17 @@ def _force_release_session_lock(client):
         logger.warning(f"Failed to release session lock: {e}")
 
 
-async def _maybe_reconnect_client():
+async def _maybe_reconnect_client(force=False):
     """Check if consecutive connection errors warrant a client reconnect.
 
     Called from download_media error handlers. Returns True if reconnect was
     triggered (caller should abort current download), False otherwise.
+
+    Args:
+        force: If True, skip cooldown check (used by watchdog cancel which
+               has already determined the connection is dead).
     """
-    if _client_conn_errors["count"] < _CLIENT_RECONNECT_THRESHOLD:
+    if _client_conn_errors["count"] < _CLIENT_RECONNECT_THRESHOLD and not force:
         return False
 
     if _client_reconnecting["active"]:
@@ -1093,7 +1097,7 @@ async def _maybe_reconnect_client():
         return True
 
     now = time.time()
-    if now - _client_last_reconnect["time"] < _CLIENT_RECONNECT_COOLDOWN:
+    if not force and now - _client_last_reconnect["time"] < _CLIENT_RECONNECT_COOLDOWN:
         logger.debug(
             f"Reconnect cooldown active ({int(_CLIENT_RECONNECT_COOLDOWN - (now - _client_last_reconnect['time']))}s remaining), skipping"
         )
