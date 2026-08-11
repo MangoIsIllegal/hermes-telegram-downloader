@@ -768,7 +768,7 @@ async def worker(client: pyrogram.client.Client):
                 download_task(target_client, message, node)
             )
             dl_task_start = time.time()
-            _MAX_TASK_RUNTIME = 1800  # 30分钟最大运行时间（心跳从未设置时的后备超时）
+            _MAX_TASK_RUNTIME = 300  # 5分钟最大运行时间（心跳从未设置时的后备超时）
             watchdog_triggered = False
             try:
                 while not dl_task.done():
