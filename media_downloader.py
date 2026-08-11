@@ -1051,30 +1051,48 @@ def _force_release_session_lock(client):
     """强制释放 Pyrogram session SQLite 锁。
 
     stop() 超时被 cancel 时，Pyrogram 内部的 SQLite transaction 不会被回滚，
-    EXCLUSIVE 锁残留在 journal 文件里。清理方法：
-    1. 删除 -journal 文件（SQLite WAL/journal 残留）
-    2. 重置 client 内部的 session 引用，强制 start() 重新打开 DB
+    EXCLUSIVE 锁残留在 SQLite 连接上。清理方法：
+    1. 关闭 storage 的 SQLite 连接（client.storage.conn）
+    2. 关闭 MTProto session 的 TCP 连接（client.session）
+    3. 删除 -journal 文件（SQLite WAL/journal 残留）
+    4. 重置 client 内部状态，强制 start() 重新打开 DB
     """
     import os
     try:
-        session_path = os.path.join(app.session_file_path, "media_downloader.session")
-        journal_path = session_path + "-journal"
-        wal_path = session_path + "-wal"
-        shm_path = session_path + "-shm"
-        for f in [journal_path, wal_path, shm_path]:
-            if os.path.exists(f):
-                os.remove(f)
-                logger.info(f"Removed stale SQLite file: {f}")
-        # 重置 Pyrogram 内部 session 引用，让 start() 重新打开 DB 连接
-        if hasattr(client, "session") and client.session:
+        # 1. 关闭 storage 的 SQLite 连接 — 这才是持有锁的对象
+        storage = getattr(client, "storage", None)
+        if storage and getattr(storage, "conn", None):
             try:
-                client.session.close()
+                storage.conn.close()
+                logger.info("Closed storage SQLite connection")
+            except Exception:
+                pass
+            storage.conn = None
+        # 2. 关闭 MTProto session 的 TCP 连接
+        session = getattr(client, "session", None)
+        if session:
+            try:
+                # Session.stop() 会关 connection，但可能 hang，用 disconnect
+                conn = getattr(session, "connection", None)
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
             except Exception:
                 pass
             client.session = None
-        # 重置 start/initialized 标志
+        # 3. 删除 journal 文件
+        session_path = os.path.join(app.session_file_path, "media_downloader.session")
+        for suffix in ["-journal", "-wal", "-shm"]:
+            f = session_path + suffix
+            if os.path.exists(f):
+                os.remove(f)
+                logger.info(f"Removed stale SQLite file: {f}")
+        # 4. 重置 client 内部状态
         client.is_initialized = False
-        logger.info("Reset client session reference and is_initialized flag")
+        client.is_connected = False
+        logger.info("Reset client session/storage/flags for clean restart")
     except Exception as e:
         logger.warning(f"Failed to release session lock: {e}")
 
