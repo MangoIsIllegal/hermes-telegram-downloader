@@ -978,6 +978,7 @@
                 // Pending list refreshes every 5 seconds
                 this.pendingPollTimer = setInterval(() => {
                     this.fetchPending();
+                    this.fetchFailed();
                 }, 5000);
                 // Completed: poll count only, fetch increment if new completions
                 this.completedPollTimer = setInterval(() => {
@@ -1171,7 +1172,10 @@
                     this.completedLoading = false;
                 }
                 await this.loadMoreCompleted();
-                // Also fetch failed tasks
+                await this.fetchFailed();
+            },
+
+            async fetchFailed() {
                 try {
                     const failedRes = await fetch('/get_failed_downloads');
                     const failedData = await failedRes.json();
