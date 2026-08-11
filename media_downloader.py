@@ -63,6 +63,8 @@ _CLIENT_RECONNECT_THRESHOLD = 10
 _client_reconnecting = {"active": False}
 _client_last_reconnect = {"time": 0.0}
 _CLIENT_RECONNECT_COOLDOWN = 300  # 5 min between reconnect attempts
+_MAX_WATCHDOG_RETRIES = 2  # watchdog cancel 后最多重试次数
+_watchdog_retry_count = {}  # task_id → 已重试次数
 _main_client_ref = {"client": None}  # set in start_server()
 
 logging.getLogger("pyrogram.session.session").addFilter(LogFilter())
@@ -254,6 +256,57 @@ async def _get_media_meta(
         temp_file_name = os.path.join(app.temp_save_path, dirname, gen_file_name)
         file_name = os.path.join(file_save_path, gen_file_name)
     return truncate_filename(file_name), truncate_filename(temp_file_name), file_format
+
+
+def _move_task_to_failed(node, message, error_message):
+    """移任务到失败列表 + 清理 placeholder + 从 bot_tasks.json 删除。"""
+    try:
+        from module.download_stat import add_failed_download, delete_download_result_entry as _ddre
+        from module.task_store import complete_task as _ct
+        if node and node.task_id:
+            msg_id = message.id if message else 0
+            source_link = ""
+            if getattr(node, 'source_chat_id', 0) and getattr(node, 'source_message_id', 0):
+                sid = node.source_chat_id
+                link_id = str(sid)[4:] if str(sid).startswith("-100") else str(sid)
+                source_link = f"https://t.me/c/{link_id}/{node.source_message_id}"
+            add_failed_download(
+                chat_id=node.chat_id,
+                msg_id=msg_id,
+                task_id=getattr(node, "task_id_display", str(node.task_id)),
+                file_name="",
+                error_message=error_message,
+                total_size=0,
+                source_link=source_link,
+                from_user_id=str(getattr(node, "from_user_id", "")) or "",
+            )
+            _ddre(node.chat_id, msg_id)
+            _ct(node.task_id)
+            _watchdog_retry_count.pop(node.task_id, None)
+    except Exception:
+        pass
+
+
+async def _reset_task_for_retry(node, message):
+    """重置 node 状态，准备重新入队下载。"""
+    from module.download_stat import _download_cache, delete_download_result_entry as _ddre
+    import time as _time
+    # 清理 download_cache，防止 record_download_status 装饰器短路返回 Downloading
+    key = (node.chat_id, message.id)
+    _download_cache.pop(key, None)
+    # 清理 _download_result placeholder
+    _ddre(node.chat_id, message.id)
+    # 重置 node 状态
+    node.total_task = 0
+    node.total_download_task = 0
+    node.success_download_task = 0
+    node.failed_download_task = 0
+    node.skip_download_task = 0
+    node.download_status = {}
+    node.last_reply_time = _time.time()
+    node.last_edit_msg = ""
+    node.last_progress_pct = -1
+    node.initial_progress_reported = False
 
 
 async def add_download_task(message: pyrogram.types.Message, node: TaskNode):
@@ -788,76 +841,69 @@ async def worker(client: pyrogram.client.Client):
                         break
                 # 等待 dl_task 完成（正常结束或 cancel）
                 await dl_task
+                # 正常完成 → 清理重试计数
+                _watchdog_retry_count.pop(node.task_id, None)
             except asyncio.CancelledError:
                 # dl_task 被 cancel 时 await 会抛 CancelledError
                 if watchdog_triggered:
                     logger.warning(
                         f"Worker: task {node.task_id_display} cancelled by heartbeat watchdog"
                     )
-                    # 心跳超时说明 TCP 连接已死，递增错误计数并触发重连
-                    # 不走 download_media 的 except handler（cancel 是外部杀的），
-                    # 所以必须在这里手动触发，否则重连永远不会被激活
+                    # 心跳超时说明 TCP 连接已死，递增错误计数
                     _client_conn_errors["count"] += 3
-                    asyncio.create_task(_maybe_reconnect_client(force=True))
-                    # watchdog cancel 跳过了 download_media 的 except handler，
-                    # 移到失败列表而非直接删除，方便手动确认
-                    try:
-                        from module.download_stat import add_failed_download, delete_download_result_entry as _ddre
-                        from module.task_store import complete_task as _wct
-                        if node and node.task_id:
-                            msg_id = message.id if message else 0
-                            source_link = ""
-                            if getattr(node, 'source_chat_id', 0) and getattr(node, 'source_message_id', 0):
-                                sid = node.source_chat_id
-                                link_id = str(sid)[4:] if str(sid).startswith("-100") else str(sid)
-                                source_link = f"https://t.me/c/{link_id}/{node.source_message_id}"
-                            add_failed_download(
-                                chat_id=node.chat_id,
-                                msg_id=msg_id,
-                                task_id=getattr(node, "task_id_display", str(node.task_id)),
-                                file_name="",
-                                error_message="下载超时被watchdog取消（连接无响应）",
-                                total_size=0,
-                                source_link=source_link,
-                                from_user_id=str(getattr(node, "from_user_id", "")) or "",
-                            )
-                            _ddre(node.chat_id, msg_id)
-                            _wct(node.task_id)
-                            logger.info(f"Worker: moved task {node.task_id_display} to failed after watchdog cancel")
-                    except Exception:
-                        pass
+                    # 同步等待重连结果（不是 fire-and-forget）
+                    reconnect_ok = await _maybe_reconnect_client(force=True)
+                    retry_count = _watchdog_retry_count.get(node.task_id, 0)
+                    if reconnect_ok and retry_count < _MAX_WATCHDOG_RETRIES:
+                        # 重连成功 + 还有重试次数 → 重新入队
+                        _watchdog_retry_count[node.task_id] = retry_count + 1
+                        logger.info(
+                            f"Worker: requeue task {node.task_id_display} "
+                            f"(retry {retry_count + 1}/{_MAX_WATCHDOG_RETRIES}) after watchdog cancel + reconnect"
+                        )
+                        await _reset_task_for_retry(node, message)
+                        clear_task_heartbeat(composite_key)
+                        node.total_task = 1
+                        node.is_running = True
+                        await queue.put((message, node))
+                        continue
+                    else:
+                        # 重连失败或重试次数用完 → 移到失败列表
+                        if not reconnect_ok:
+                            err_msg = "下载超时被watchdog取消（重连失败）"
+                        else:
+                            err_msg = f"下载超时被watchdog取消（重试{_MAX_WATCHDOG_RETRIES}次后仍失败）"
+                        logger.warning(
+                            f"Worker: moving task {node.task_id_display} to failed: {err_msg}"
+                        )
+                        _move_task_to_failed(node, message, err_msg)
                 else:
                     raise
             finally:
                 clear_task_heartbeat(composite_key)
         except Exception as e:
             logger.exception(f"Worker exception for task {getattr(node, 'task_id_display', '?')}: {e}")
-            # 防止幽灵任务：任何异常退出都移到失败列表，方便手动确认
-            try:
-                from module.download_stat import add_failed_download, delete_download_result_entry as _ddre
-                from module.task_store import complete_task as _ct
-                if node and node.task_id:
-                    msg_id = message.id if message else 0
-                    source_link = ""
-                    if getattr(node, 'source_chat_id', 0) and getattr(node, 'source_message_id', 0):
-                        sid = node.source_chat_id
-                        link_id = str(sid)[4:] if str(sid).startswith("-100") else str(sid)
-                        source_link = f"https://t.me/c/{link_id}/{node.source_message_id}"
-                    add_failed_download(
-                        chat_id=node.chat_id,
-                        msg_id=msg_id,
-                        task_id=getattr(node, "task_id_display", str(node.task_id)),
-                        file_name="",
-                        error_message=f"Worker异常: {str(e)[:80]}",
-                        total_size=0,
-                        source_link=source_link,
-                        from_user_id=str(getattr(node, "from_user_id", "")) or "",
+            # ConnectionError 说明 client 已 stopped，先尝试重连+重试
+            error_str = str(e)
+            if "Client has not been started" in error_str or "ConnectionError" in error_str:
+                _client_conn_errors["count"] += 3
+                reconnect_ok = await _maybe_reconnect_client(force=True)
+                retry_count = _watchdog_retry_count.get(node.task_id, 0)
+                if reconnect_ok and retry_count < _MAX_WATCHDOG_RETRIES:
+                    _watchdog_retry_count[node.task_id] = retry_count + 1
+                    logger.info(
+                        f"Worker: requeue task {node.task_id_display} "
+                        f"(retry {retry_count + 1}/{_MAX_WATCHDOG_RETRIES}) after exception + reconnect"
                     )
-                    _ddre(node.chat_id, msg_id)
-                    _ct(node.task_id)
-                    logger.info(f"Worker: moved task {node.task_id_display} to failed after exception")
-            except Exception:
-                pass
+                    await _reset_task_for_retry(node, message)
+                    clear_task_heartbeat(f"{node.chat_id}_{message.id}" if message else "")
+                    node.total_task = 1
+                    node.is_running = True
+                    if message:
+                        await queue.put((message, node))
+                    continue
+            # 移到失败列表
+            _move_task_to_failed(node, message, f"Worker异常: {error_str[:80]}")
 
 
 async def download_chat_task(client: pyrogram.Client, chat_download_config: ChatDownloadConfig, node: TaskNode):
