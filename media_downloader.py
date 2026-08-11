@@ -980,6 +980,10 @@ async def _reconnect_client():
 
     所有操作都加 asyncio.wait_for 超时，防止 stop()/start() 在半死 TCP 上 hang
     15分钟（TCP.TIMEOUT=900s）导致 _client_reconnecting["active"] 永久锁死。
+
+    SQLite 锁处理：stop() 超时后 Pyrogram 的 session DB 可能持有 EXCLUSIVE 锁
+    未释放，导致 start() 报 "database is locked"。需要在 stop 超时后手动
+    清理 SQLite journal 文件 + 重置 Pyrogram 内部 session 引用。
     """
     client = _main_client_ref["client"]
     if client is None:
@@ -1003,9 +1007,14 @@ async def _reconnect_client():
             # 强制重置连接标志 — disconnect() 可能因 is_initialized=True 而失败，
             # 但我们需要让 start()→connect() 能重新建立连接
             client.is_connected = False
+            # 关键：stop() 超时后 SQLite EXCLUSIVE 锁可能未释放，
+            # 导致后续 start() 报 "database is locked"。
+            # 手动清理：1) 删除 journal 文件 2) 重置 session 引用
+            _force_release_session_lock(client)
         except Exception as e:
             logger.warning(f"client.stop() during reconnect failed (continuing): {e}")
             client.is_connected = False
+            _force_release_session_lock(client)
 
         # start() 加 30s 超时 — 防止 start() 在未清理干净的 session 上 hang
         logger.warning("Client auto-reconnect: start()...")
@@ -1018,10 +1027,54 @@ async def _reconnect_client():
             logger.error("client.start() timed out after 30s, reconnect failed")
             return False
         except Exception as e:
+            error_str = str(e)
+            if "database is locked" in error_str:
+                # 二次锁清理后重试一次
+                logger.warning(f"client.start() failed with database is locked, forcing release and retrying...")
+                _force_release_session_lock(client)
+                try:
+                    await asyncio.wait_for(client.start(), timeout=30)
+                    logger.success("Client reconnected successfully on retry — fresh TCP session established")
+                    _client_conn_errors["count"] = 0
+                    return True
+                except Exception as e2:
+                    logger.error(f"client.start() retry also failed: {e2}")
             logger.error(f"client.start() during reconnect failed: {e}")
             return False
     finally:
         _client_reconnecting["active"] = False
+
+
+def _force_release_session_lock(client):
+    """强制释放 Pyrogram session SQLite 锁。
+
+    stop() 超时被 cancel 时，Pyrogram 内部的 SQLite transaction 不会被回滚，
+    EXCLUSIVE 锁残留在 journal 文件里。清理方法：
+    1. 删除 -journal 文件（SQLite WAL/journal 残留）
+    2. 重置 client 内部的 session 引用，强制 start() 重新打开 DB
+    """
+    import os
+    try:
+        session_path = os.path.join(app.session_file_path, "media_downloader.session")
+        journal_path = session_path + "-journal"
+        wal_path = session_path + "-wal"
+        shm_path = session_path + "-shm"
+        for f in [journal_path, wal_path, shm_path]:
+            if os.path.exists(f):
+                os.remove(f)
+                logger.info(f"Removed stale SQLite file: {f}")
+        # 重置 Pyrogram 内部 session 引用，让 start() 重新打开 DB 连接
+        if hasattr(client, "session") and client.session:
+            try:
+                client.session.close()
+            except Exception:
+                pass
+            client.session = None
+        # 重置 start/initialized 标志
+        client.is_initialized = False
+        logger.info("Reset client session reference and is_initialized flag")
+    except Exception as e:
+        logger.warning(f"Failed to release session lock: {e}")
 
 
 async def _maybe_reconnect_client():
