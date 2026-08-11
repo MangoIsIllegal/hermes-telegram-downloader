@@ -800,12 +800,29 @@ async def worker(client: pyrogram.client.Client):
                     _client_conn_errors["count"] += 3
                     asyncio.create_task(_maybe_reconnect_client())
                     # watchdog cancel 跳过了 download_media 的 except handler，
-                    # 必须在这里清理任务，否则永久卡在 downloading
+                    # 移到失败列表而非直接删除，方便手动确认
                     try:
+                        from module.download_stat import add_failed_download
                         from module.task_store import complete_task as _wct
                         if node and node.task_id:
+                            msg_id = message.id if message else 0
+                            source_link = ""
+                            if getattr(node, 'source_chat_id', 0) and getattr(node, 'source_message_id', 0):
+                                sid = node.source_chat_id
+                                link_id = str(sid)[4:] if str(sid).startswith("-100") else str(sid)
+                                source_link = f"https://t.me/c/{link_id}/{node.source_message_id}"
+                            add_failed_download(
+                                chat_id=node.chat_id,
+                                msg_id=msg_id,
+                                task_id=getattr(node, "task_id_display", str(node.task_id)),
+                                file_name="",
+                                error_message="下载超时被watchdog取消（连接无响应）",
+                                total_size=0,
+                                source_link=source_link,
+                                from_user_id=str(getattr(node, "from_user_id", "")) or "",
+                            )
                             _wct(node.task_id)
-                            logger.info(f"Worker: force-completed task {node.task_id_display} after watchdog cancel")
+                            logger.info(f"Worker: moved task {node.task_id_display} to failed after watchdog cancel")
                     except Exception:
                         pass
                 else:
@@ -814,13 +831,29 @@ async def worker(client: pyrogram.client.Client):
                 clear_task_heartbeat(composite_key)
         except Exception as e:
             logger.exception(f"Worker exception for task {getattr(node, 'task_id_display', '?')}: {e}")
-            # 防止幽灵任务：任何异常退出都必须清理任务状态，
-            # 否则 download_state 永远 "downloading"，并发守卫永久阻塞
+            # 防止幽灵任务：任何异常退出都移到失败列表，方便手动确认
             try:
+                from module.download_stat import add_failed_download
                 from module.task_store import complete_task as _ct
                 if node and node.task_id:
+                    msg_id = message.id if message else 0
+                    source_link = ""
+                    if getattr(node, 'source_chat_id', 0) and getattr(node, 'source_message_id', 0):
+                        sid = node.source_chat_id
+                        link_id = str(sid)[4:] if str(sid).startswith("-100") else str(sid)
+                        source_link = f"https://t.me/c/{link_id}/{node.source_message_id}"
+                    add_failed_download(
+                        chat_id=node.chat_id,
+                        msg_id=msg_id,
+                        task_id=getattr(node, "task_id_display", str(node.task_id)),
+                        file_name="",
+                        error_message=f"Worker异常: {str(e)[:80]}",
+                        total_size=0,
+                        source_link=source_link,
+                        from_user_id=str(getattr(node, "from_user_id", "")) or "",
+                    )
                     _ct(node.task_id)
-                    logger.info(f"Worker: force-completed task {node.task_id_display} after exception")
+                    logger.info(f"Worker: moved task {node.task_id_display} to failed after exception")
             except Exception:
                 pass
 
