@@ -1146,26 +1146,34 @@ def _force_release_session_lock(client):
 async def _maybe_reconnect_client(force=False):
     """Check if consecutive connection errors warrant a client reconnect.
 
-    Called from download_media error handlers. Returns True if reconnect was
-    triggered (caller should abort current download), False otherwise.
+    Returns True if client is currently connected (either was already connected,
+    or reconnect succeeded). Returns False if reconnect failed or was skipped.
 
     Args:
         force: If True, skip cooldown check (used by watchdog cancel which
                has already determined the connection is dead).
     """
     if _client_conn_errors["count"] < _CLIENT_RECONNECT_THRESHOLD and not force:
-        return False
+        # Below threshold and not forced — assume client is fine
+        return True
 
     if _client_reconnecting["active"]:
         logger.debug("Reconnect already in progress, skipping")
-        return True
+        # Another reconnect is in progress — wait for it to finish, then check result
+        # Can't wait here (would block), so return False to be safe
+        # Caller will move task to failed, which is correct — task can be retried later
+        return False
 
     now = time.time()
     if not force and now - _client_last_reconnect["time"] < _CLIENT_RECONNECT_COOLDOWN:
         logger.debug(
             f"Reconnect cooldown active ({int(_CLIENT_RECONNECT_COOLDOWN - (now - _client_last_reconnect['time']))}s remaining), skipping"
         )
-        return True
+        # In cooldown — don't reconnect, but check if client is still connected
+        client = _main_client_ref.get("client")
+        if client and getattr(client, "is_connected", False):
+            return True
+        return False
 
     logger.warning(
         f"Client connection errors reached {_client_conn_errors['count']} "
@@ -1176,6 +1184,7 @@ async def _maybe_reconnect_client(force=False):
     if not success:
         # Reconnect failed — retry sooner (60s instead of full cooldown)
         _client_last_reconnect["time"] = now - _CLIENT_RECONNECT_COOLDOWN + 60
+        return False
     return True
 
 
