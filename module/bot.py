@@ -1987,16 +1987,18 @@ async def _consume_one_pending():
         if not pending:
             return
         # 并发守卫：用内存计数器替代 JSON 文件读写，消除 TOCTOU 竞态
-        # _active_downloads 是 worker pick up 时 +1, 完成/失败/cancel 时 -1 的内存值
-        # 注意：必须用 import media_downloader 然后访问属性，不能用 from ... import
-        # 因为 int 是不可变类型，from import 做的是值拷贝，worker 里 +=1 不会反映到这边
-        import media_downloader as _md
+        # _active_downloads 在 __main__ 模块（python media_downloader.py 启动时）
+        # worker 的 global _active_downloads 改的是 __main__ 的全局变量，
+        # 而不是 import media_downloader 的。必须用 sys.modules['__main__']
+        import sys
+        _main = sys.modules.get('__main__')
         in_queue_count = len(getattr(_bot, '_in_queue', set()))
         consuming_count = len(getattr(_bot, '_consuming', set()))
         max_tasks = getattr(_bot.app, 'max_download_task', 5)
-        _total_active = _md._active_downloads + in_queue_count + consuming_count
+        _active = getattr(_main, '_active_downloads', 0) if _main else 0
+        _total_active = _active + in_queue_count + consuming_count
         if _total_active >= max_tasks:
-            logger.info(f"Pending consumer: concurrency guard blocked (active={_md._active_downloads} in_queue={in_queue_count} consuming={consuming_count} max={max_tasks} id={id(_md._active_downloads)})")
+            logger.info(f"Pending consumer: concurrency guard blocked (active={_active} in_queue={in_queue_count} consuming={consuming_count} max={max_tasks})")
             return
 
         # Find first truly pending task (not already in asyncio Queue)
