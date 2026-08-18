@@ -1988,11 +1988,13 @@ async def _consume_one_pending():
             return
         # 并发守卫：用内存计数器替代 JSON 文件读写，消除 TOCTOU 竞态
         # _active_downloads 是 worker pick up 时 +1, 完成/失败/cancel 时 -1 的内存值
-        from media_downloader import _active_downloads
+        # 注意：必须用 import media_downloader 然后访问属性，不能用 from ... import
+        # 因为 int 是不可变类型，from import 做的是值拷贝，worker 里 +=1 不会反映到这边
+        import media_downloader as _md
         in_queue_count = len(getattr(_bot, '_in_queue', set()))
         consuming_count = len(getattr(_bot, '_consuming', set()))
         max_tasks = getattr(_bot.app, 'max_download_task', 5)
-        if _active_downloads + in_queue_count + consuming_count >= max_tasks:
+        if _md._active_downloads + in_queue_count + consuming_count >= max_tasks:
             return
 
         # Find first truly pending task (not already in asyncio Queue)
