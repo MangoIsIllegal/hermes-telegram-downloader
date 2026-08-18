@@ -1994,7 +1994,9 @@ async def _consume_one_pending():
         in_queue_count = len(getattr(_bot, '_in_queue', set()))
         consuming_count = len(getattr(_bot, '_consuming', set()))
         max_tasks = getattr(_bot.app, 'max_download_task', 5)
-        if _md._active_downloads + in_queue_count + consuming_count >= max_tasks:
+        _total_active = _md._active_downloads + in_queue_count + consuming_count
+        if _total_active >= max_tasks:
+            logger.info(f"Pending consumer: concurrency guard blocked (active={_md._active_downloads} in_queue={in_queue_count} consuming={consuming_count} max={max_tasks})")
             return
 
         # Find first truly pending task (not already in asyncio Queue)
