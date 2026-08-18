@@ -808,7 +808,7 @@ async def worker(client: pyrogram.client.Client):
             message = item[0]
             node: TaskNode = item[1]
             _active_downloads += 1  # 并发计数 +1
-            logger.info(f"Worker picked up message {message.id} from chat {node.chat_id} for task {node.task_id_display} (active={_active_downloads})")
+            logger.info(f"Worker picked up message {message.id} from chat {node.chat_id} for task {node.task_id_display} (active={_active_downloads}, id(id)={id(_active_downloads)})")
             _requeued = False  # 标记是否重新入队（重新入队时不 decrement，因为新 worker 会 +1）
             # Mark task as actively downloading (no longer pending/in-queue)
             if node.task_id:
