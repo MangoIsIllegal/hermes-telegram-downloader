@@ -66,6 +66,8 @@ _CLIENT_RECONNECT_COOLDOWN = 300  # 5 min between reconnect attempts
 _MAX_WATCHDOG_RETRIES = 2  # watchdog cancel 后最多重试次数
 _watchdog_retry_count = {}  # task_id → 已重试次数
 _main_client_ref = {"client": None}  # set in start_server()
+_active_downloads = 0  # 内存计数器：当前正在下载的任务数（worker pick up +1, 完成/失败/cancel -1）
+                       # 替代 get_downloading_tasks() JSON 读写做并发守卫，消除 TOCTOU 竞态
 
 logging.getLogger("pyrogram.session.session").addFilter(LogFilter())
 logging.getLogger("pyrogram.client").addFilter(LogFilter())
@@ -799,12 +801,15 @@ async def worker(client: pyrogram.client.Client):
         _TASK_HEARTBEAT_TIMEOUT, get_task_heartbeat_age, clear_task_heartbeat,
     )
     while app.is_running:
+        global _active_downloads
         try:
             logger.info(f"Worker waiting for queue item...")
             item = await queue.get()
             message = item[0]
             node: TaskNode = item[1]
-            logger.info(f"Worker picked up message {message.id} from chat {node.chat_id} for task {node.task_id_display}")
+            _active_downloads += 1  # 并发计数 +1
+            logger.info(f"Worker picked up message {message.id} from chat {node.chat_id} for task {node.task_id_display} (active={_active_downloads})")
+            _requeued = False  # 标记是否重新入队（重新入队时不 decrement，因为新 worker 会 +1）
             # Mark task as actively downloading (no longer pending/in-queue)
             if node.task_id:
                 from module.bot import _bot
@@ -866,6 +871,7 @@ async def worker(client: pyrogram.client.Client):
                         node.total_task = 1
                         node.is_running = True
                         await queue.put((message, node))
+                        _requeued = True
                         continue
                     else:
                         # 重连失败或重试次数用完 → 移到失败列表
@@ -901,9 +907,14 @@ async def worker(client: pyrogram.client.Client):
                     node.is_running = True
                     if message:
                         await queue.put((message, node))
+                    _requeued = True
                     continue
             # 移到失败列表
             _move_task_to_failed(node, message, f"Worker异常: {error_str[:80]}")
+        finally:
+            # 并发计数 -1（重新入队的除外，新 worker 会 +1）
+            if not _requeued:
+                _active_downloads -= 1
 
 
 async def download_chat_task(client: pyrogram.Client, chat_download_config: ChatDownloadConfig, node: TaskNode):
@@ -1283,9 +1294,10 @@ def main():
         queue = asyncio.Queue()
         logger.success(_t("Successfully started (Press Ctrl+C to stop)"))
         app.loop.create_task(download_all_chat(client))
-        # Always start 6 workers (max). Consumer guards actual concurrency
-        # via app.max_download_task. Idle workers block on queue.get() — zero cost.
-        _MAX_WORKERS = 6
+        # Worker 数量 = max_download_task，物理上限制并发
+        # 之前硬编码 6 个 worker，并发守卫有竞态时直接放行超量任务
+        _MAX_WORKERS = max(1, getattr(app, 'max_download_task', 2))
+        logger.info(f"Starting {_MAX_WORKERS} workers (max_download_task={_MAX_WORKERS})")
         for _ in range(_MAX_WORKERS):
             tasks.append(app.loop.create_task(worker(client)))
         if app.bot_token:

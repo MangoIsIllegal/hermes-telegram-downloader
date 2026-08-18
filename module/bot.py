@@ -1981,18 +1981,18 @@ async def _consume_one_pending():
     import logging
     logger = logging.getLogger("bot.pending")
     try:
-        from module.task_store import get_pending_tasks, update_download_state, remove_task, get_downloading_tasks
+        from module.task_store import get_pending_tasks, update_download_state, remove_task
         add_download_task = _bot.add_download_task
         pending = get_pending_tasks()
         if not pending:
             return
-        # Concurrency guard: don't feed more tasks than workers can handle.
-        # downloading (in worker) + in_queue (waiting for worker) + consuming (in get_messages) >= max → stop.
-        downloading = get_downloading_tasks()
+        # 并发守卫：用内存计数器替代 JSON 文件读写，消除 TOCTOU 竞态
+        # _active_downloads 是 worker pick up 时 +1, 完成/失败/cancel 时 -1 的内存值
+        from media_downloader import _active_downloads
         in_queue_count = len(getattr(_bot, '_in_queue', set()))
         consuming_count = len(getattr(_bot, '_consuming', set()))
         max_tasks = getattr(_bot.app, 'max_download_task', 5)
-        if len(downloading) + in_queue_count + consuming_count >= max_tasks:
+        if _active_downloads + in_queue_count + consuming_count >= max_tasks:
             return
 
         # Find first truly pending task (not already in asyncio Queue)
