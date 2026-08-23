@@ -291,7 +291,8 @@ def _move_task_to_failed(node, message, error_message):
 
 async def _reset_task_for_retry(node, message):
     """重置 node 状态，准备重新入队下载。"""
-    from module.download_stat import _download_cache, delete_download_result_entry as _ddre
+    from module.pyrogram_extension import _download_cache
+    from module.download_stat import delete_download_result_entry as _ddre
     import time as _time
     # 清理 download_cache，防止 record_download_status 装饰器短路返回 Downloading
     key = (node.chat_id, message.id)
