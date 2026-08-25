@@ -291,12 +291,12 @@ def _move_task_to_failed(node, message, error_message):
 
 async def _reset_task_for_retry(node, message):
     """重置 node 状态，准备重新入队下载。"""
-    from module.pyrogram_extension import _download_cache
+    from module.pyrogram_extension import remove_download_cache
     from module.download_stat import delete_download_result_entry as _ddre
     import time as _time
     # 清理 download_cache，防止 record_download_status 装饰器短路返回 Downloading
-    key = (node.chat_id, message.id)
-    _download_cache.pop(key, None)
+    # Cache 对象没有 .pop()，用 remove_download_cache 操作 .store 内部 dict
+    remove_download_cache(node.chat_id, message.id)
     # 清理 _download_result placeholder
     _ddre(node.chat_id, message.id)
     # 重置 node 状态
