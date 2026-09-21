@@ -191,9 +191,17 @@ def set_max_workers():
     except Exception:
         pass
     # 热生效：动态伸缩 worker 池（9-21）
+    # 注意：media_downloader 以 __main__ 身份运行，直接 import 会拿到独立
+    # 模块副本（双模块实例陷阱），_main_client_ref 是空的。必须取
+    # sys.modules['__main__'] 那份——与 bot.py consumer 的 _active_downloads
+    # 同款处理。
     try:
-        import media_downloader as _md
-        _md._worker_pool_set_target(n)
+        import sys as _sys
+        _md = _sys.modules.get("__main__")
+        if _md is not None and hasattr(_md, "_worker_pool_set_target"):
+            _md._worker_pool_set_target(n)
+        else:
+            logger.warning("set_max_workers: __main__ has no _worker_pool_set_target")
     except Exception as e:
         logger.warning(f"set_max_workers: worker pool adjust failed: {e}")
     # Persist to config file

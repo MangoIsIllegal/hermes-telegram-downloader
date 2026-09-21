@@ -106,7 +106,11 @@ def _worker_pool_set_target(n: int):
                     _live_workers += 1
                 added += 1
             except Exception as e:
-                logger.error(f"Worker pool: failed to spawn worker: {e}")
+                logger.error(
+                    f"Worker pool: failed to spawn worker: {e} "
+                    f"(loop={loop}, is_running={loop.is_running() if loop else None}, "
+                    f"cur={cur}, n={n})"
+                )
                 break
         logger.info(f"Worker pool: scaled up {cur} -> {cur + added} workers")
     elif n < cur:
