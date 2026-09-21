@@ -69,6 +69,46 @@ _main_client_ref = {"client": None}  # set in start_server()
 _active_downloads = 0  # 内存计数器：当前正在下载的任务数（worker pick up +1, 完成/失败/cancel -1）
                        # 替代 get_downloading_tasks() JSON 读写做并发守卫，消除 TOCTOU 竞态
 
+# --- 动态 worker 池（9-21）：WebUI 改 max_download_task 不重启即时生效 ---
+import threading as _threading
+_worker_pool_lock = _threading.Lock()
+_live_workers = 0          # 当前存活的 worker 数（启动 +1，退出 -1）
+_worker_exit_signal = False  # 缩容信号：多余 worker 在取到任务前自检退出
+
+
+def _worker_pool_set_target(n: int):
+    """设置目标 worker 数并同步伸缩 worker 池（在 event loop 内调用）。"""
+    global _worker_exit_signal, _live_workers
+    with _worker_pool_lock:
+        cur = _live_workers
+    if n > cur:
+        # 扩容：补足差额
+        import asyncio as _aio
+        added = 0
+        for _ in range(n - cur):
+            try:
+                _aio.get_running_loop().create_task(worker(_main_client_ref["client"]))
+                with _worker_pool_lock:
+                    _live_workers += 1
+                added += 1
+            except Exception as e:
+                logger.error(f"Worker pool: failed to spawn worker: {e}")
+                break
+        logger.info(f"Worker pool: scaled up {cur} -> {cur + added} workers")
+    elif n < cur:
+        # 缩容：置退出信号，用哨兵唤醒所有卡在 queue.get() 的 worker，
+        # 多余的 worker 醒来后自检退出；多放的哨兵会被正常 worker 忽略
+        global queue
+        _worker_exit_signal = True
+        excess = cur - n
+        for _ in range(cur):  # 唤醒所有等待中的 worker
+            try:
+                queue.put_nowait(None)
+            except Exception:
+                pass
+        logger.info(f"Worker pool: scaling down {cur} -> {n} workers ({excess} excess)")
+    return cur
+
 logging.getLogger("pyrogram.session.session").addFilter(LogFilter())
 logging.getLogger("pyrogram.client").addFilter(LogFilter())
 
@@ -987,121 +1027,138 @@ async def worker(client: pyrogram.client.Client):
     from module.download_stat import (
         _TASK_HEARTBEAT_TIMEOUT, get_task_heartbeat_age, clear_task_heartbeat,
     )
-    while app.is_running:
-        global _active_downloads
-        try:
-            logger.info(f"Worker waiting for queue item...")
-            item = await queue.get()
-            message = item[0]
-            node: TaskNode = item[1]
-            _active_downloads += 1  # 并发计数 +1
-            logger.info(f"Worker picked up message {message.id} from chat {node.chat_id} for task {node.task_id_display} (active={_active_downloads})")
-            _requeued = False  # 标记是否重新入队（重新入队时不 decrement，因为新 worker 会 +1）
-            # Mark task as actively downloading (no longer pending/in-queue)
-            if node.task_id:
-                from module.bot import _bot
-                _bot._in_queue.discard(node.task_id)
-                update_download_state(node.task_id, "downloading")
-            if node.is_stop_transmission:
-                continue
-
-            target_client = node.client if node.client else client
-            composite_key = f"{node.chat_id}_{message.id}"
-
-            # 用 Task 包裹 download_task，配合心跳 watchdog 检测死连接
-            dl_task = asyncio.create_task(
-                download_task(target_client, message, node)
-            )
-            dl_task_start = time.time()
-            _MAX_TASK_RUNTIME = 300  # 5分钟最大运行时间（心跳从未设置时的后备超时）
-            watchdog_triggered = False
+    global _live_workers
+    with _worker_pool_lock:
+        _live_workers += 1
+    try:
+        while app.is_running:
+            global _active_downloads
             try:
-                while not dl_task.done():
-                    await asyncio.sleep(30)  # 每 30s 检查一次心跳
-                    if dl_task.done():
-                        break
-                    age = get_task_heartbeat_age(composite_key)
-                    runtime = time.time() - dl_task_start
-                    if age > _TASK_HEARTBEAT_TIMEOUT or (age < 0 and runtime > _MAX_TASK_RUNTIME):
-                        logger.error(
-                            f"Worker: task {node.task_id_display} (msg {message.id}) "
-                            f"no progress for {int(age)}s (>{_TASK_HEARTBEAT_TIMEOUT}s), "
-                            f"cancelling — likely dead TCP connection"
+                logger.info(f"Worker waiting for queue item...")
+                item = await queue.get()
+                # 动态缩容：哨兵 None 唤醒 → 若自己是多余的 worker 则退出
+                if item is None:
+                    with _worker_pool_lock:
+                        target = max(1, getattr(app, "max_download_task", 2))
+                        if _worker_exit_signal and _live_workers > target:
+                            _live_workers -= 1
+                            logger.info(f"Worker exiting (pool scale-down, live={_live_workers})")
+                            return
+                        # 非多余 worker：忽略哨兵，继续工作
+                    continue
+                message = item[0]
+                node: TaskNode = item[1]
+                _active_downloads += 1  # 并发计数 +1
+                logger.info(f"Worker picked up message {message.id} from chat {node.chat_id} for task {node.task_id_display} (active={_active_downloads})")
+                _requeued = False  # 标记是否重新入队（重新入队时不 decrement，因为新 worker 会 +1）
+                # Mark task as actively downloading (no longer pending/in-queue)
+                if node.task_id:
+                    from module.bot import _bot
+                    _bot._in_queue.discard(node.task_id)
+                    update_download_state(node.task_id, "downloading")
+                if node.is_stop_transmission:
+                    continue
+
+                target_client = node.client if node.client else client
+                composite_key = f"{node.chat_id}_{message.id}"
+
+                # 用 Task 包裹 download_task，配合心跳 watchdog 检测死连接
+                dl_task = asyncio.create_task(
+                    download_task(target_client, message, node)
+                )
+                dl_task_start = time.time()
+                _MAX_TASK_RUNTIME = 300  # 5分钟最大运行时间（心跳从未设置时的后备超时）
+                watchdog_triggered = False
+                try:
+                    while not dl_task.done():
+                        await asyncio.sleep(30)  # 每 30s 检查一次心跳
+                        if dl_task.done():
+                            break
+                        age = get_task_heartbeat_age(composite_key)
+                        runtime = time.time() - dl_task_start
+                        if age > _TASK_HEARTBEAT_TIMEOUT or (age < 0 and runtime > _MAX_TASK_RUNTIME):
+                            logger.error(
+                                f"Worker: task {node.task_id_display} (msg {message.id}) "
+                                f"no progress for {int(age)}s (>{_TASK_HEARTBEAT_TIMEOUT}s), "
+                                f"cancelling — likely dead TCP connection"
+                            )
+                            dl_task.cancel()
+                            watchdog_triggered = True
+                            break
+                    # 等待 dl_task 完成（正常结束或 cancel）
+                    await dl_task
+                    # 正常完成 → 清理重试计数
+                    _watchdog_retry_count.pop(node.task_id, None)
+                except asyncio.CancelledError:
+                    # dl_task 被 cancel 时 await 会抛 CancelledError
+                    if watchdog_triggered:
+                        logger.warning(
+                            f"Worker: task {node.task_id_display} cancelled by heartbeat watchdog"
                         )
-                        dl_task.cancel()
-                        watchdog_triggered = True
-                        break
-                # 等待 dl_task 完成（正常结束或 cancel）
-                await dl_task
-                # 正常完成 → 清理重试计数
-                _watchdog_retry_count.pop(node.task_id, None)
-            except asyncio.CancelledError:
-                # dl_task 被 cancel 时 await 会抛 CancelledError
-                if watchdog_triggered:
-                    logger.warning(
-                        f"Worker: task {node.task_id_display} cancelled by heartbeat watchdog"
-                    )
-                    # 心跳超时说明 TCP 连接已死，递增错误计数
+                        # 心跳超时说明 TCP 连接已死，递增错误计数
+                        _client_conn_errors["count"] += 3
+                        # 同步等待重连结果（不是 fire-and-forget）
+                        reconnect_ok = await _maybe_reconnect_client(force=True)
+                        retry_count = _watchdog_retry_count.get(node.task_id, 0)
+                        if reconnect_ok and retry_count < _MAX_WATCHDOG_RETRIES:
+                            # 重连成功 + 还有重试次数 → 重新入队
+                            _watchdog_retry_count[node.task_id] = retry_count + 1
+                            logger.info(
+                                f"Worker: requeue task {node.task_id_display} "
+                                f"(retry {retry_count + 1}/{_MAX_WATCHDOG_RETRIES}) after watchdog cancel + reconnect"
+                            )
+                            await _reset_task_for_retry(node, message)
+                            clear_task_heartbeat(composite_key)
+                            node.total_task = 1
+                            node.is_running = True
+                            await queue.put((message, node))
+                            _requeued = True
+                            continue
+                        else:
+                            # 重连失败或重试次数用完 → 移到失败列表
+                            if not reconnect_ok:
+                                err_msg = "下载超时被watchdog取消（重连失败）"
+                            else:
+                                err_msg = f"下载超时被watchdog取消（重试{_MAX_WATCHDOG_RETRIES}次后仍失败）"
+                            logger.warning(
+                                f"Worker: moving task {node.task_id_display} to failed: {err_msg}"
+                            )
+                            _move_task_to_failed(node, message, err_msg)
+                    else:
+                        raise
+                finally:
+                    clear_task_heartbeat(composite_key)
+            except Exception as e:
+                logger.exception(f"Worker exception for task {getattr(node, 'task_id_display', '?')}: {e}")
+                # ConnectionError 说明 client 已 stopped，先尝试重连+重试
+                error_str = str(e)
+                if "Client has not been started" in error_str or "ConnectionError" in error_str:
                     _client_conn_errors["count"] += 3
-                    # 同步等待重连结果（不是 fire-and-forget）
                     reconnect_ok = await _maybe_reconnect_client(force=True)
                     retry_count = _watchdog_retry_count.get(node.task_id, 0)
                     if reconnect_ok and retry_count < _MAX_WATCHDOG_RETRIES:
-                        # 重连成功 + 还有重试次数 → 重新入队
                         _watchdog_retry_count[node.task_id] = retry_count + 1
                         logger.info(
                             f"Worker: requeue task {node.task_id_display} "
-                            f"(retry {retry_count + 1}/{_MAX_WATCHDOG_RETRIES}) after watchdog cancel + reconnect"
+                            f"(retry {retry_count + 1}/{_MAX_WATCHDOG_RETRIES}) after exception + reconnect"
                         )
                         await _reset_task_for_retry(node, message)
-                        clear_task_heartbeat(composite_key)
+                        clear_task_heartbeat(f"{node.chat_id}_{message.id}" if message else "")
                         node.total_task = 1
                         node.is_running = True
-                        await queue.put((message, node))
+                        if message:
+                            await queue.put((message, node))
                         _requeued = True
                         continue
-                    else:
-                        # 重连失败或重试次数用完 → 移到失败列表
-                        if not reconnect_ok:
-                            err_msg = "下载超时被watchdog取消（重连失败）"
-                        else:
-                            err_msg = f"下载超时被watchdog取消（重试{_MAX_WATCHDOG_RETRIES}次后仍失败）"
-                        logger.warning(
-                            f"Worker: moving task {node.task_id_display} to failed: {err_msg}"
-                        )
-                        _move_task_to_failed(node, message, err_msg)
-                else:
-                    raise
+                # 移到失败列表
+                _move_task_to_failed(node, message, f"Worker异常: {error_str[:80]}")
             finally:
-                clear_task_heartbeat(composite_key)
-        except Exception as e:
-            logger.exception(f"Worker exception for task {getattr(node, 'task_id_display', '?')}: {e}")
-            # ConnectionError 说明 client 已 stopped，先尝试重连+重试
-            error_str = str(e)
-            if "Client has not been started" in error_str or "ConnectionError" in error_str:
-                _client_conn_errors["count"] += 3
-                reconnect_ok = await _maybe_reconnect_client(force=True)
-                retry_count = _watchdog_retry_count.get(node.task_id, 0)
-                if reconnect_ok and retry_count < _MAX_WATCHDOG_RETRIES:
-                    _watchdog_retry_count[node.task_id] = retry_count + 1
-                    logger.info(
-                        f"Worker: requeue task {node.task_id_display} "
-                        f"(retry {retry_count + 1}/{_MAX_WATCHDOG_RETRIES}) after exception + reconnect"
-                    )
-                    await _reset_task_for_retry(node, message)
-                    clear_task_heartbeat(f"{node.chat_id}_{message.id}" if message else "")
-                    node.total_task = 1
-                    node.is_running = True
-                    if message:
-                        await queue.put((message, node))
-                    _requeued = True
-                    continue
-            # 移到失败列表
-            _move_task_to_failed(node, message, f"Worker异常: {error_str[:80]}")
-        finally:
-            # 并发计数 -1（重新入队的除外，新 worker 会 +1）
-            if not _requeued:
-                _active_downloads -= 1
+                # 并发计数 -1（重新入队的除外，新 worker 会 +1）
+                if not _requeued:
+                    _active_downloads -= 1
+    finally:
+        with _worker_pool_lock:
+            _live_workers -= 1
 
 
 async def download_chat_task(client: pyrogram.Client, chat_download_config: ChatDownloadConfig, node: TaskNode):
@@ -1485,7 +1542,11 @@ def main():
         # 之前硬编码 6 个 worker，并发守卫有竞态时直接放行超量任务
         _MAX_WORKERS = max(1, getattr(app, 'max_download_task', 2))
         logger.info(f"Starting {_MAX_WORKERS} workers (max_download_task={_MAX_WORKERS})")
+        with _worker_pool_lock:
+            _live_workers = 0  # 重置计数（main 只在启动时跑一次）
         for _ in range(_MAX_WORKERS):
+            with _worker_pool_lock:
+                _live_workers += 1
             tasks.append(app.loop.create_task(worker(client)))
         if app.bot_token:
             app.loop.run_until_complete(start_download_bot(app, client, add_download_task, download_chat_task))

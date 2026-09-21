@@ -175,7 +175,7 @@ def get_max_workers():
 
 @_flask_app.route("/set_max_workers", methods=["POST"])
 def set_max_workers():
-    """Set max download task count (1-6, affects consumer concurrency guard)"""
+    """Set max download task count (1-6, hot-applies to the live worker pool)"""
     n = request.args.get("n", type=int)
     if n is None or n < 1 or n > 6:
         return jsonify(error="n must be 1-6"), 400
@@ -190,6 +190,12 @@ def set_max_workers():
             set_max_concurrent_transmissions(_bot.client, n * 5)
     except Exception:
         pass
+    # 热生效：动态伸缩 worker 池（9-21）
+    try:
+        import media_downloader as _md
+        _md._worker_pool_set_target(n)
+    except Exception as e:
+        logger.warning(f"set_max_workers: worker pool adjust failed: {e}")
     # Persist to config file
     _app.update_config(True)
     return jsonify(max_workers=n)
