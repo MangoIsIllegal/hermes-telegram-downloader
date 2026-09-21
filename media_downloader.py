@@ -643,8 +643,15 @@ async def download_media(
             _pre_size = os.path.getsize(_pyrogram_temp) if os.path.exists(_pyrogram_temp) else 0
             if _pre_size > 0:
                 try:
-                    if message is None:
+                    # 无条件刷新消息引用：上一轮的 message 对象引用可能已过期
+                    # （FILE_REFERENCE_EXPIRED 正是这么发生的），fetch 幂等且便宜
+                    try:
                         message = await fetch_message(client, message)
+                        if message is None:
+                            logger.error(f"Message[{message_id}] {ui_file_name}: 消息已被删除，终止续传")
+                            break
+                    except Exception as fetch_err:
+                        logger.warning(f"Message[{message_id}] {ui_file_name}: fetch_message failed: {fetch_err}")
                     resumed = await _resume_download_from_temp(
                         client, message, temp_file_name, media_size,
                         node, ui_file_name, task_start_time,
@@ -661,11 +668,17 @@ async def download_media(
                     logger.warning(f"Message[{message.id}]: resume pre-loop size mismatch, will retry")
                     error_message = "续传后大小不符"
                 except Exception as resume_err:
+                    # 关键：绝不回落到 client.download_media —— 它 open("wb")
+                    # 会把断点文件截断为 0，销毁全部进度（16:36 事故根因）。
+                    # 保留 .temp，跳到下一轮 retry，用新引用继续续传。
                     logger.warning(
                         f"Message[{message.id}] {ui_file_name}: pre-loop resume failed: "
-                        f"{type(resume_err).__name__}: {str(resume_err)[:100]}"
+                        f"{type(resume_err).__name__}: {str(resume_err)[:100]}, "
+                        f"retry with fresh reference (temp preserved)"
                     )
                     error_message = f"续传失败: {str(resume_err)[:60]}"
+                    await asyncio.sleep(RETRY_TIME_OUT)
+                    continue
         try:
             temp_download_path = await client.download_media(
                 message, file_name=temp_file_name,
@@ -744,10 +757,12 @@ async def download_media(
                 except Exception as resume_err:
                     logger.warning(
                         f"Message[{message.id}] {ui_file_name}: resume failed: "
-                        f"{type(resume_err).__name__}: {str(resume_err)[:100]}, falling back to full retry"
+                        f"{type(resume_err).__name__}: {str(resume_err)[:100]}, "
+                        f"retry with fresh reference (temp preserved)"
                     )
                     error_message = f"续传失败: {str(resume_err)[:60]}"
-                    # 不删除 temp，继续走下方原有重试路径
+                    # 不删除 temp，不回落到 download_media（会截断 .temp）
+                    await asyncio.sleep(RETRY_TIME_OUT)
             if _check_timeout(retry, message.id):
                 logger.error(
                     f"Message[{message.id}]: {_t('file reference expired for 3 retries, download skipped.')}"
