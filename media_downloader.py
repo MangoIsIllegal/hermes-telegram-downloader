@@ -172,10 +172,15 @@ async def _resume_download_from_temp(
     from pyrogram import utils as pyrogram_utils
     import functools
 
-    if not temp_file_name or not os.path.exists(temp_file_name):
+    if not temp_file_name:
+        return False
+    # pyrogram 实际写盘路径是 <temp_file_name>.temp（handle_download 内部拼接），
+    # temp_file_name 本身不带 .temp 后缀 —— 断点文件必须查 .temp 路径
+    real_temp = temp_file_name if temp_file_name.endswith(".temp") else temp_file_name + ".temp"
+    if not os.path.exists(real_temp):
         return False
 
-    existing = os.path.getsize(temp_file_name)
+    existing = os.path.getsize(real_temp)
     if existing <= 0:
         return False
     if media_size > 0 and existing >= media_size:
@@ -187,7 +192,7 @@ async def _resume_download_from_temp(
     if aligned != existing:
         # 截断到 1MB 边界（1MB 内的残余数据丢弃）
         try:
-            os.truncate(temp_file_name, aligned)
+            os.truncate(real_temp, aligned)
         except OSError as e:
             logger.warning(f"Resume: truncate failed: {e}, fallback to full re-download")
             return False
@@ -214,7 +219,7 @@ async def _resume_download_from_temp(
 
     from module.download_stat import update_download_status
 
-    with open(temp_file_name, "r+b") as f:
+    with open(real_temp, "r+b") as f:
         f.seek(aligned)
         async for chunk in client.get_file(
             file_id_obj, real_size, 0, offset_mb,
@@ -223,11 +228,16 @@ async def _resume_download_from_temp(
         ):
             f.write(chunk)
 
-    final_size = os.path.getsize(temp_file_name)
+    final_size = os.path.getsize(real_temp)
     logger.info(
         f"Resume download finished: {ui_file_name} now {final_size} bytes "
         f"(expected {media_size})"
     )
+    # 续传完成后把 <name>.temp 归位为 temp_file_name（模拟 pyrogram 成功路径），
+    # 调用方的 _check_download_finish/_move_to_download_path 依赖该路径
+    if real_temp != temp_file_name and os.path.exists(temp_file_name):
+        os.remove(temp_file_name)
+    os.rename(real_temp, temp_file_name)
     return True
 
 
@@ -624,14 +634,13 @@ async def download_media(
     message_id = message.id
     total_wait = 0
     for retry in range(3):
-        # 断点续传（9-21 修复）：每次尝试前，若 .temp 存在且有数据，先尝试续传。
-        # 覆盖三个场景：①文件引用过期重试 ②watchdog 取消 requeue ③容器重启恢复。
-        # pyrogram 原生 download_media 会 open("wb") 截断 temp 从 0 重下，
-        # 因此续传必须在此之前进行。
-        if temp_file_name and os.path.exists(temp_file_name) \
-                and os.path.getsize(temp_file_name) > 0 \
-                and not (media_size > 0 and os.path.getsize(temp_file_name) >= media_size):
-            _pre_size = os.path.getsize(temp_file_name) if os.path.exists(temp_file_name) else 0
+        # 断点续传（9-21 修复）：每次尝试前，若 pyrogram 断点文件存在且有数据，先续传。
+        # pyrogram 实际写盘为 temp_file_name + ".temp"，检查必须带后缀。
+        _pyrogram_temp = (temp_file_name + ".temp") if temp_file_name else None
+        if _pyrogram_temp and os.path.exists(_pyrogram_temp) \
+                and os.path.getsize(_pyrogram_temp) > 0 \
+                and not (media_size > 0 and os.path.getsize(_pyrogram_temp) >= media_size):
+            _pre_size = os.path.getsize(_pyrogram_temp) if os.path.exists(_pyrogram_temp) else 0
             if _pre_size > 0:
                 try:
                     if message is None:
@@ -714,8 +723,8 @@ async def download_media(
                 logger.error(f"Message[{message_id}] {ui_file_name}: fetch_message returned None (file ref expired), message may be deleted")
                 error_message = "消息不存在或已被删除（文件引用过期）"
                 break
-            # 尝试从 .temp 断点续传（不再删除 temp）
-            if temp_file_name and os.path.exists(temp_file_name):
+            # 尝试从 pyrogram 断点文件（temp_file_name + ".temp"）续传
+            if temp_file_name and os.path.exists(temp_file_name + ".temp"):
                 try:
                     resumed = await _resume_download_from_temp(
                         client, message, temp_file_name, media_size,
