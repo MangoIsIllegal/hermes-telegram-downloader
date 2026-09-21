@@ -76,18 +76,32 @@ _live_workers = 0          # 当前存活的 worker 数（启动 +1，退出 -1�
 _worker_exit_signal = False  # 缩容信号：多余 worker 在取到任务前自检退出
 
 
+async def _spawn_one_worker(client):
+    """在主 event loop 内创建一个 worker task（供 run_coroutine_threadsafe 调度）。"""
+    import asyncio as _aio
+    _aio.get_running_loop().create_task(worker(client))
+
+
 def _worker_pool_set_target(n: int):
-    """设置目标 worker 数并同步伸缩 worker 池（在 event loop 内调用）。"""
+    """设置目标 worker 数并同步伸缩 worker 池（可能从 Flask 线程调用）。"""
     global _worker_exit_signal, _live_workers
     with _worker_pool_lock:
         cur = _live_workers
     if n > cur:
-        # 扩容：补足差额
+        # 扩容：补足差额。注意：本函数可能从 Flask 线程调用（无 running loop），
+        # 必须把 create_task 调度到 pyrogram 主 event loop 上执行
         import asyncio as _aio
         added = 0
+        client = _main_client_ref.get("client")
+        loop = client.loop if client and getattr(client, "loop", None) else None
         for _ in range(n - cur):
             try:
-                _aio.get_running_loop().create_task(worker(_main_client_ref["client"]))
+                if loop and loop.is_running():
+                    # 线程安全提交：run_coroutine_threadsafe 包一层
+                    fut = _aio.run_coroutine_threadsafe(_spawn_one_worker(client), loop)
+                    fut.result(timeout=10)
+                else:
+                    _aio.get_running_loop().create_task(worker(client))
                 with _worker_pool_lock:
                     _live_workers += 1
                 added += 1
