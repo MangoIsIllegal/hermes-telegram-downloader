@@ -76,7 +76,11 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 
 def _check_download_finish(media_size: int, download_path: str, ui_file_name: str):
-    """Check download task if finish"""
+    """Check download task if finish.
+
+    大小不匹配时不再删除部分文件——保留为 .temp，下一次重试由
+    _resume_download_from_temp 从断点续传（9-21 断点续传修复）。
+    """
     download_size = os.path.getsize(download_path)
     if media_size == download_size:
         logger.success(f"{_t('Successfully downloaded')} - {ui_file_name}")
@@ -86,7 +90,22 @@ def _check_download_finish(media_size: int, download_path: str, ui_file_name: st
             f"{download_size}, {_t('actual')}: "
             f"{media_size}, {_t('file name')}: {ui_file_name}"
         )
-        os.remove(download_path)
+        # 保留部分文件 → 改名为 .temp 供断点续传（原逻辑: os.remove(download_path)）
+        temp_path = download_path + ".temp"
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            os.rename(download_path, temp_path)
+            logger.info(
+                f"Partial file preserved for resume: {temp_path} "
+                f"({download_size} bytes)"
+            )
+        except OSError as rename_err:
+            logger.warning(f"Could not preserve partial file: {rename_err}")
+            try:
+                os.remove(download_path)
+            except OSError:
+                pass
         raise pyrogram.errors.exceptions.bad_request_400.BadRequest()
 
 
@@ -125,6 +144,91 @@ def _cleanup_temp_file(temp_file_name: str):
             os.remove(temp_file_name)
         except OSError:
             pass
+
+
+_MB = 1024 * 1024
+
+
+async def _resume_download_from_temp(
+    client: pyrogram.client.Client,
+    message: pyrogram.types.Message,
+    temp_file_name: str,
+    media_size: int,
+    node,
+    ui_file_name: str,
+    task_start_time: float,
+) -> bool:
+    """断点续传：若 .temp 已有部分数据，从 1MB 对齐的边界继续下载并追加。
+
+    pyrogram 的 handle_download 用 open(path, "wb") 打开 temp 且 offset 固定 0，
+    每次调用都会从头下载。此函数绕过它：
+      1. 读取现有 .temp 大小，截断到 1MB 对齐边界（MTProto offset 要求）
+      2. 从 fresh message 提取 FileId（文件引用已刷新）
+      3. client.get_file(file_id, size, 0, offset_mb) 生成器逐块追加
+    返回 True 表示续传完成（调用方继续走 _check_download_finish）。
+    抛出异常表示续传失败（调用方按原有重试逻辑处理）。
+    """
+    from pyrogram.file_id import FileId
+    from pyrogram import utils as pyrogram_utils
+    import functools
+
+    if not temp_file_name or not os.path.exists(temp_file_name):
+        return False
+
+    existing = os.path.getsize(temp_file_name)
+    if existing <= 0:
+        return False
+    if media_size > 0 and existing >= media_size:
+        # temp 已是完整大小，交回调用方校验
+        return False
+
+    aligned = (existing // _MB) * _MB
+    offset_mb = aligned // _MB
+    if aligned != existing:
+        # 截断到 1MB 边界（1MB 内的残余数据丢弃）
+        try:
+            os.truncate(temp_file_name, aligned)
+        except OSError as e:
+            logger.warning(f"Resume: truncate failed: {e}, fallback to full re-download")
+            return False
+
+    if aligned <= 0:
+        return False
+
+    logger.info(
+        f"Resume download: {ui_file_name} from {aligned/1024/1024:.0f}MB "
+        f"(had {existing} bytes, aligned to {aligned})"
+    )
+
+    # 从 fresh message 提取 FileId（fetch_message 后 file_reference 已刷新）
+    media = getattr(message, "video", None) or getattr(message, "document", None) \
+        or getattr(message, "audio", None) or getattr(message, "photo", None) \
+        or getattr(message, "voice", None) or getattr(message, "video_note", None) \
+        or getattr(message, "animation", None)
+    if media is None:
+        logger.warning("Resume: no downloadable media in refreshed message")
+        return False
+    file_id_str = media if isinstance(media, str) else media.file_id
+    file_id_obj = FileId.decode(file_id_str)
+    real_size = getattr(media, "file_size", 0) or media_size
+
+    from module.download_stat import update_download_status
+
+    with open(temp_file_name, "r+b") as f:
+        f.seek(aligned)
+        async for chunk in client.get_file(
+            file_id_obj, real_size, 0, offset_mb,
+            progress=update_download_status,
+            progress_args=(message.id, ui_file_name, task_start_time, node, client),
+        ):
+            f.write(chunk)
+
+    final_size = os.path.getsize(temp_file_name)
+    logger.info(
+        f"Resume download finished: {ui_file_name} now {final_size} bytes "
+        f"(expected {media_size})"
+    )
+    return True
 
 
 def _cleanup_stale_temp_files():
@@ -520,6 +624,39 @@ async def download_media(
     message_id = message.id
     total_wait = 0
     for retry in range(3):
+        # 断点续传（9-21 修复）：每次尝试前，若 .temp 存在且有数据，先尝试续传。
+        # 覆盖三个场景：①文件引用过期重试 ②watchdog 取消 requeue ③容器重启恢复。
+        # pyrogram 原生 download_media 会 open("wb") 截断 temp 从 0 重下，
+        # 因此续传必须在此之前进行。
+        if temp_file_name and os.path.exists(temp_file_name) \
+                and os.path.getsize(temp_file_name) > 0 \
+                and not (media_size > 0 and os.path.getsize(temp_file_name) >= media_size):
+            _pre_size = os.path.getsize(temp_file_name) if os.path.exists(temp_file_name) else 0
+            if _pre_size > 0:
+                try:
+                    if message is None:
+                        message = await fetch_message(client, message)
+                    resumed = await _resume_download_from_temp(
+                        client, message, temp_file_name, media_size,
+                        node, ui_file_name, task_start_time,
+                    )
+                    if resumed:
+                        _check_download_finish(media_size, temp_file_name, ui_file_name)
+                        await asyncio.sleep(0.5)
+                        _move_to_download_path(temp_file_name, file_name)
+                        _client_conn_errors["count"] = 0
+                        logger.info(f"Message[{message.id}] {ui_file_name}: 断点续传完成（pre-loop）")
+                        return DownloadStatus.SuccessDownload, file_name, ""
+                except pyrogram.errors.exceptions.bad_request_400.BadRequest:
+                    # 续传后大小仍不符 → 保留 temp 继续重试循环
+                    logger.warning(f"Message[{message.id}]: resume pre-loop size mismatch, will retry")
+                    error_message = "续传后大小不符"
+                except Exception as resume_err:
+                    logger.warning(
+                        f"Message[{message.id}] {ui_file_name}: pre-loop resume failed: "
+                        f"{type(resume_err).__name__}: {str(resume_err)[:100]}"
+                    )
+                    error_message = f"续传失败: {str(resume_err)[:60]}"
         try:
             temp_download_path = await client.download_media(
                 message, file_name=temp_file_name,
@@ -563,7 +700,7 @@ async def download_media(
                     if error_message:
                         error_message = f"{error_message}（重试3次后失败）"
         except pyrogram.errors.exceptions.bad_request_400.BadRequest:
-            _cleanup_temp_file(temp_file_name)
+            # 断点续传（9-21 修复）：保留 .temp，刷新消息引用后从断点续传
             logger.warning(
                 f"Message[{message.id}]: {_t('file reference expired, refetching')}..."
             )
@@ -577,6 +714,31 @@ async def download_media(
                 logger.error(f"Message[{message_id}] {ui_file_name}: fetch_message returned None (file ref expired), message may be deleted")
                 error_message = "消息不存在或已被删除（文件引用过期）"
                 break
+            # 尝试从 .temp 断点续传（不再删除 temp）
+            if temp_file_name and os.path.exists(temp_file_name):
+                try:
+                    resumed = await _resume_download_from_temp(
+                        client, message, temp_file_name, media_size,
+                        node, ui_file_name, task_start_time,
+                    )
+                    if resumed:
+                        _check_download_finish(media_size, temp_file_name, ui_file_name)
+                        await asyncio.sleep(0.5)
+                        _move_to_download_path(temp_file_name, file_name)
+                        _client_conn_errors["count"] = 0
+                        logger.info(f"Message[{message.id}] {ui_file_name}: 断点续传完成")
+                        return DownloadStatus.SuccessDownload, file_name, ""
+                except pyrogram.errors.exceptions.bad_request_400.BadRequest:
+                    # 续传后大小仍不符 → 下一轮 retry；temp 已保留
+                    error_message = "文件引用过期（续传后大小仍不符）"
+                    continue
+                except Exception as resume_err:
+                    logger.warning(
+                        f"Message[{message.id}] {ui_file_name}: resume failed: "
+                        f"{type(resume_err).__name__}: {str(resume_err)[:100]}, falling back to full retry"
+                    )
+                    error_message = f"续传失败: {str(resume_err)[:60]}"
+                    # 不删除 temp，继续走下方原有重试路径
             if _check_timeout(retry, message.id):
                 logger.error(
                     f"Message[{message.id}]: {_t('file reference expired for 3 retries, download skipped.')}"
