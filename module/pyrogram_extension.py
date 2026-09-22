@@ -1769,7 +1769,7 @@ def _patch_pyrogram_handle_download():
 
         _os.makedirs(directory, exist_ok=True) if not in_memory else None
         temp_file_path = _os.path.abspath(
-            _re.sub("\\", "/", _os.path.join(directory, file_name))
+            _re.sub("\\\\", "/", _os.path.join(directory, file_name))
         ) + ".temp"
         file = _BytesIO() if in_memory else open(temp_file_path, "wb")
 
