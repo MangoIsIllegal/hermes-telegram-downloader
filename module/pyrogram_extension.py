@@ -1771,7 +1771,13 @@ def _patch_pyrogram_handle_download():
         temp_file_path = _os.path.abspath(
             _re.sub("\\\\", "/", _os.path.join(directory, file_name))
         ) + ".temp"
-        file = _BytesIO() if in_memory else open(temp_file_path, "wb")
+        # 9-22 修复：.temp 已有数据时用 "r+b"（从位置 0 覆盖写，语义等价
+        # 但不截断尾部）—— get_file 异常时至少保住已下载的字节。
+        # "wb" 是 606MB 断点被清零的元凶。
+        if not in_memory and _os.path.exists(temp_file_path) and _os.path.getsize(temp_file_path) > 0:
+            file = open(temp_file_path, "r+b")
+        else:
+            file = _BytesIO() if in_memory else open(temp_file_path, "wb")
 
         try:
             async for chunk in self.get_file(file_id, file_size, 0, 0, progress, progress_args):

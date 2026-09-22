@@ -287,6 +287,14 @@ async def _resume_download_from_temp(
             f.write(chunk)
 
     final_size = os.path.getsize(real_temp)
+    # 9-22 修复（0913-183 进度归零）：get_file 提前断流时 async for
+    # 会"正常"结束而不抛异常，若把断流当成功就会归位 rename 并让外层
+    # 误判完成 → 后续 client.download_media open("wb") 截断断点。
+    # 断流必须显式抛错，保留 .temp 等下一轮续传。
+    if media_size > 0 and final_size < media_size:
+        raise ConnectionError(
+            f"resume stream ended early: {final_size}/{media_size} bytes"
+        )
     logger.info(
         f"Resume download finished: {ui_file_name} now {final_size} bytes "
         f"(expected {media_size})"
@@ -695,9 +703,14 @@ async def download_media(
         # 断点续传（9-21 修复）：每次尝试前，若 pyrogram 断点文件存在且有数据，先续传。
         # pyrogram 实际写盘为 temp_file_name + ".temp"，检查必须带后缀。
         _pyrogram_temp = (temp_file_name + ".temp") if temp_file_name else None
+        # 9-22 修复（0913-183 进度归零）：.temp 有数据但本轮未续传成功时，
+        # 绝不能掉进 client.download_media —— handle_download 的
+        # open("wb") 会把断点文件截断为 0（606MB→0 元凶）。
+        _resume_attempted = False
         if _pyrogram_temp and os.path.exists(_pyrogram_temp) \
                 and os.path.getsize(_pyrogram_temp) > 0 \
                 and not (media_size > 0 and os.path.getsize(_pyrogram_temp) >= media_size):
+            _resume_attempted = True
             _pre_size = os.path.getsize(_pyrogram_temp) if os.path.exists(_pyrogram_temp) else 0
             if _pre_size > 0:
                 try:
@@ -737,6 +750,30 @@ async def download_media(
                     error_message = f"续传失败: {str(resume_err)[:60]}"
                     await asyncio.sleep(RETRY_TIME_OUT)
                     continue
+            elif _resume_attempted:
+                # 续传前置检查通过但 _resume_download_from_temp 返回 False
+                # （media 提取失败等）——同样绝不走 download_media，防止
+                # open("wb") 截断 .temp。等下一轮重新提取引用再试。
+                logger.warning(
+                    f"Message[{message_id}] {ui_file_name}: "
+                    f"resume skipped (no media in refreshed message), "
+                    f"temp preserved, retrying"
+                )
+                error_message = "续传跳过：刷新消息中无媒体"
+                await asyncio.sleep(RETRY_TIME_OUT)
+                continue
+        if _resume_attempted and _pyrogram_temp and os.path.exists(_pyrogram_temp) \
+                and os.path.getsize(_pyrogram_temp) > 0:
+            # 走到这里说明本轮续传没成功也没 continue 掉——保险拦截：
+            # .temp 仍有数据时永远不进入 client.download_media（截断风险）
+            logger.warning(
+                f"Message[{message_id}] {ui_file_name}: "
+                f"skip download_media to protect .temp "
+                f"({os.path.getsize(_pyrogram_temp)} bytes), retrying"
+            )
+            error_message = "保护断点，等待续传"
+            await asyncio.sleep(RETRY_TIME_OUT)
+            continue
         try:
             temp_download_path = await client.download_media(
                 message, file_name=temp_file_name,
