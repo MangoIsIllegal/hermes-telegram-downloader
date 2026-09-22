@@ -826,8 +826,12 @@ async def download_media(
                     f"Message[{message.id}]: {_t('file reference expired for 3 retries, download skipped.')}"
                 )
                 error_message = "文件引用过期（重试3次后失败）"
-        except pyrogram.errors.exceptions.flood_420.FloodWait as wait_err:
-            _cleanup_temp_file(temp_file_name)
+        except (pyrogram.errors.exceptions.flood_420.FloodWait,
+                pyrogram.errors.FloodPremiumWait) as wait_err:
+            # FLOOD_PREMIUM_WAIT_X 与 FloodWait 是兄弟类（都继承 Flood），
+            # 必须一并捕获，否则 premium 限速直接穿透到 except Exception
+            # 把任务判死（9-22 修复）。两者都有 .value 等待秒数。
+            # 注意：不删除 temp——断点文件是续传资产
             # 累计 FloodWait 超过600 秒则不再等待
             total_wait += wait_err.value
             if total_wait > 600:
