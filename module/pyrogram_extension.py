@@ -1744,3 +1744,72 @@ async def forward_messages(
         )
 
     return types.List(forwarded_messages) if is_iterable else forwarded_messages[0]
+
+
+# ============================================================
+# pyrogram handle_download 断点保留补丁（2026-09-22）
+# 原版在 except BaseException 里 os.remove(temp_file_path)：
+# watchdog cancel / 网络异常 / 引用过期都会把已下载的 .temp 删掉，
+# 394MB+408MB 进度就是这么蒸发的。改为保留 .temp 供断点续传。
+# ============================================================
+def _patch_pyrogram_handle_download():
+    import os as _os
+    from io import BytesIO as _BytesIO
+    import asyncio as _asyncio
+    import re as _re
+
+    from pyrogram.client import Client as _Client
+    from pyrogram.errors import FloodWait as _FloodWait, FloodPremiumWait as _FloodPremiumWait
+
+    if getattr(_Client.handle_download, "_tgdown_resume_patch", False):
+        return  # 已打补丁
+
+    async def handle_download_keep_temp(self, packet):
+        file_id, directory, file_name, in_memory, file_size, progress, progress_args = packet
+
+        _os.makedirs(directory, exist_ok=True) if not in_memory else None
+        temp_file_path = _os.path.abspath(
+            _re.sub("\\", "/", _os.path.join(directory, file_name))
+        ) + ".temp"
+        file = _BytesIO() if in_memory else open(temp_file_path, "wb")
+
+        try:
+            async for chunk in self.get_file(file_id, file_size, 0, 0, progress, progress_args):
+                file.write(chunk)
+        except BaseException as e:
+            if not in_memory:
+                try:
+                    file.close()
+                except Exception:
+                    pass
+                # ★ 核心差异：保留 .temp 断点文件，不再 os.remove
+                # （仅当文件是 0 字节空壳时清理，避免垃圾堆积）
+                try:
+                    if _os.path.getsize(temp_file_path) == 0:
+                        _os.remove(temp_file_path)
+                except Exception:
+                    pass
+
+            if isinstance(e, _asyncio.CancelledError):
+                raise e
+
+            if isinstance(e, (_FloodWait, _FloodPremiumWait)):
+                raise e
+
+            return None
+        else:
+            if in_memory:
+                file.name = file_name
+                return file
+            else:
+                file.close()
+                file_path = _os.path.splitext(temp_file_path)[0]
+                import shutil as _shutil
+                _shutil.move(temp_file_path, file_path)
+                return file_path
+
+    handle_download_keep_temp._tgdown_resume_patch = True
+    _Client.handle_download = handle_download_keep_temp
+
+
+_patch_pyrogram_handle_download()
