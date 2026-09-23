@@ -196,10 +196,17 @@ def _is_exist(file_path: str) -> bool:
 
 
 def _cleanup_temp_file(temp_file_name: str):
-    """Remove temp file if it exists."""
+    """Remove temp file only if it is empty (0 bytes).
+
+    9-23 判死审计批次2：改为"只删 0 字节"（与 pyrogram 补丁同款语义）。
+    原版无条件 os.remove，会删掉 _resume_download_from_temp 归位后的
+    temp_file_name（不带 .temp 后缀的完整/部分数据）——判死路径上
+    销毁可续传资产。0 字节空壳仍清理，避免垃圾堆积。
+    """
     if temp_file_name and os.path.exists(temp_file_name):
         try:
-            os.remove(temp_file_name)
+            if os.path.getsize(temp_file_name) == 0:
+                os.remove(temp_file_name)
         except OSError:
             pass
 
@@ -1025,8 +1032,11 @@ async def download_media(
                 _unified_flood_wait["until"] = time.time() + backoff + 5
                 _unified_flood_wait["reason"] = f"连接超时疑似限速 (msg {message.id})"
             else:
-                # 普通连接错误，保持原有指数退避：10s, 20s, 40s
-                backoff = 10 * (2 ** retry)
+                # 普通连接错误，指数退避：10s, 60s, 300s
+                # 9-23 判死审计批次2：上限从 40s 提到 300s——代理故障恢复
+                # 常需数分钟，40s 上限对连续故障基本必死。300s 退避期间
+                # watchdog 兜底（心跳超时 cancel → requeue → 续传接手）
+                backoff = [10, 60, 300][min(retry, 2)]
             _client_conn_errors["count"] += 1
             if await _maybe_reconnect_client():
                 backoff = 5  # Short backoff after reconnect
@@ -1076,6 +1086,24 @@ async def download_media(
                 f"{_t('could not be downloaded due to following exception')}:\n[{e}].",
                 exc_info=True,
             )
+            # 9-23 判死审计批次2：未知瞬时异常不再一次判死，先重试 1 次。
+            # 计数器与重试配额双重防死循环：retry 循环本身最多 3 轮，
+            # 且每轮重试消耗 1 次配额，最多多 1 次机会。
+            _unknown_retries = getattr(node, "_unknown_err_retries", 0) + 1
+            node._unknown_err_retries = _unknown_retries
+            if _unknown_retries <= 1 and retry < 2:
+                logger.warning(
+                    f"Message[{message.id}] {ui_file_name}: "
+                    f"unknown exception, retrying once before giving up "
+                    f"(temp preserved, {_unknown_retries}/1)"
+                )
+                error_message = f"下载异常（重试{_unknown_retries}/1）: {error_str[:80]}"
+                await asyncio.sleep(RETRY_TIME_OUT)
+                try:
+                    message = await fetch_message(client, message)
+                except Exception:
+                    pass  # 刷新失败不影响重试本身
+                continue
             error_message = f"下载异常: {error_str[:100]}"
             break
     # 修复：失败前检查文件是否已落盘

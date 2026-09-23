@@ -159,7 +159,7 @@ def _record_pending_failures(node):
                         msg_id=msg_id,
                         task_id=task_id_display,
                         file_name=value.get("file_name", ""),
-                        error_message="下载未开始（下载队列中未进入实际下载流程）",
+                        error_message="下载中断残留（未完成即被终止）",
                         total_size=value.get("total_size", 0),
                         source_link=source_link,
                             from_user_id=getattr(node, "from_user_id", "") or "",
@@ -2173,6 +2173,54 @@ async def _consume_one_pending():
                             remove_task(task_id)
                             from media_downloader import _maybe_reconnect_client
                             asyncio.create_task(_maybe_reconnect_client())
+                        return  # 保持 pending，不 remove_task
+                    # 9-23 判死审计批次2：网络类异常不再一次判死——
+                    # 重连窗口期 "Client has not been started yet" 曾连环误杀
+                    # 20+ 任务。复用 _pending_timeout_counts 计数（与超时
+                    # 路径同款），3 次才判死；期间设 cooldown 保持 pending。
+                    _net_err_str = str(e)
+                    _is_net_err = (
+                        "client has not been started" in _net_err_str.lower()
+                        or "connectionerror" in _net_err_str.lower()
+                        or "connection" in _net_err_str.lower()
+                        or "timeout" in _net_err_str.lower()
+                        or "flood" in _net_err_str.lower()
+                    )
+                    if _is_net_err:
+                        _pending_timeout_counts[task_id] = _pending_timeout_counts.get(task_id, 0) + 1
+                        consecutive = _pending_timeout_counts[task_id]
+                        if consecutive >= 3:
+                            logger.error(
+                                f"Pending consumer: get_messages network error x{consecutive} "
+                                f"for chat {cid} msg {msg_id}, marking as FAILED"
+                            )
+                            _pending_timeout_counts.pop(task_id, None)
+                            try:
+                                from module.download_stat import add_failed_download
+                                add_failed_download(
+                                    chat_id=cid, msg_id=msg_id,
+                                    task_id=extra.get('task_id_display', str(task_id)),
+                                    file_name="",
+                                    error_message=f"获取消息失败（连续{consecutive}次网络错误）: {_net_err_str[:80]}",
+                                    total_size=0, source_link="",
+                                    from_user_id=str(from_user_id) if from_user_id else "",
+                                )
+                            except Exception:
+                                pass
+                            remove_task(task_id)
+                            from media_downloader import _maybe_reconnect_client
+                            asyncio.create_task(_maybe_reconnect_client())
+                            return
+                        backoff = 60 * consecutive
+                        from module.pyrogram_extension import _unified_flood_wait
+                        _unified_flood_wait["until"] = time.time() + backoff + 5
+                        _unified_flood_wait["reason"] = (
+                            f"get_messages 网络错误 chat {cid} msg {msg_id} (第{consecutive}次)"
+                        )
+                        logger.warning(
+                            f"Pending consumer: get_messages network error for chat {cid} msg {msg_id}: {e}, "
+                            f"setting {backoff}s cooldown. Task stays pending (consecutive #{consecutive})."
+                        )
                         return  # 保持 pending，不 remove_task
                     logger.warning(f"Pending consumer: get_messages failed for chat {cid} msg {msg_id}: {e}, moving to failed")
                     try:
