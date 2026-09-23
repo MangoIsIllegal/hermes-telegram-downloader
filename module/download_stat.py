@@ -114,6 +114,16 @@ def clear_task_heartbeat(composite_key: str):
     _task_heartbeat.pop(composite_key, None)
 
 
+def touch_task_heartbeat(composite_key: str):
+    """Touch a task's heartbeat timestamp without changing download progress.
+
+    9-23 批次3：用于"活的等待"——resume 退避等合法长等待期间让 watchdog
+    知道任务还活着（watchdog 只认心跳时间戳，不认下载进度）。
+    """
+    if composite_key:
+        _task_heartbeat[composite_key] = time.time()
+
+
 def get_task_heartbeat_age(composite_key: str) -> float:
     """返回任务距上次进度回调的秒数。无记录返回 -1。"""
     ts = _task_heartbeat.get(composite_key)

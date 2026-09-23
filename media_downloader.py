@@ -787,7 +787,20 @@ async def download_media(
                             f"backoff {_backoff}s (does NOT consume download retries)"
                         )
                         error_message = f"续传网络错误，退避{_backoff}秒"
-                        await asyncio.sleep(_backoff)
+                        # 9-23 批次3：退避等待是"活的等待"（批次1 引入的合法
+                        # 长等待），watchdog 只认心跳，300s 大退避会被误杀
+                        # （23:00 事故 task 0916-32）。分段 sleep 并周期性
+                        # touch 心跳，让 watchdog 知道任务还活着。
+                        _waited = 0
+                        while _waited < _backoff:
+                            _chunk = min(30, _backoff - _waited)
+                            await asyncio.sleep(_chunk)
+                            _waited += _chunk
+                            try:
+                                from module.download_stat import touch_task_heartbeat
+                                touch_task_heartbeat(composite_key)
+                            except Exception:
+                                pass
                         retry -= 1  # while 循环：本轮不消耗下载重试
                         continue
                     error_message = f"续传失败: {str(resume_err)[:60]}"
@@ -1197,7 +1210,7 @@ async def worker(client: pyrogram.client.Client):
                 node: TaskNode = item[1]
                 _active_downloads += 1  # 并发计数 +1
                 logger.info(f"Worker picked up message {message.id} from chat {node.chat_id} for task {node.task_id_display} (active={_active_downloads})")
-                _requeued = False  # 标记是否重新入队（重新入队时不 decrement，因为新 worker 会 +1）
+                _requeued = False  # 保留变量供 requeue 分支标记（不再影响计数，见 finally）
                 # Mark task as actively downloading (no longer pending/in-queue)
                 if node.task_id:
                     from module.bot import _bot
@@ -1304,9 +1317,13 @@ async def worker(client: pyrogram.client.Client):
                 # 移到失败列表
                 _move_task_to_failed(node, message, f"Worker异常: {error_str[:80]}")
             finally:
-                # 并发计数 -1（重新入队的除外，新 worker 会 +1）
-                if not _requeued:
-                    _active_downloads -= 1
+                # 并发计数 -1。9-23 批次3：requeue 分支也必须 -1。
+                # 旧逻辑"_requeued 不减，新 worker 会 +1"是错的——同一个
+                # worker 会立刻 queue.get() 捡回同一任务再 +1，一个任务
+                # 占 2 个计数（22:53 事故 active=4 > max=3 的铁证），
+                # watchdog 每循环一轮泄漏 +1，最终守卫被泄漏值误拦。
+                # 任务在队列中的占用由守卫公式的 in_queue 项计入。
+                _active_downloads -= 1
     finally:
         with _worker_pool_lock:
             _live_workers -= 1
@@ -1446,54 +1463,91 @@ async def _reconnect_client():
 
     _client_reconnecting["active"] = True
     try:
-        # stop() 加 30s 超时 — 半死 TCP 上 stop() 会等 TCP.TIMEOUT(900s)
+        # stop() 加 30s 硬超时（9-23 批次3）：不再 await wait_for(client.stop())——
+        # Pyrogram stop() 内部同步阻塞时会卡住 event loop，wait_for 的超时回调
+        # 不触发，worker 协程静默冻死（23:00 事故：3 worker 全冻结在 stop()）。
+        # 改为 create_task + Event 监听：超时后放弃等待，直接返回 False，
+        # 让 watchdog 走"重连失败→任务进失败列表"路径，worker 继续活着。
+        # 绝不在 stop() 未确认完成时执行 start()——迟到的 stop() 完成时会
+        # 把 start() 建立的新连接杀掉（memory: stop() 等所有进行中操作结束）。
         logger.warning("Client auto-reconnect: stop()...")
+        stop_done = asyncio.Event()
+        stop_task = asyncio.create_task(client.stop())
+
+        def _stop_finished(_t=None):
+            stop_done.set()
+
+        stop_task.add_done_callback(_stop_finished)
         try:
-            await asyncio.wait_for(client.stop(), timeout=30)
-        except asyncio.TimeoutError:
-            logger.error("client.stop() timed out after 30s, force disconnect")
-            # stop() = terminate() + disconnect()，超时说明某一步 hang 了
-            # 手动清理 Pyrogram 内部状态，否则 start() 会报 "already connected"
+            await asyncio.wait_for(stop_done.wait(), timeout=30)
+            # stop() 在 30s 内正常结束（可能含异常，在 task 里捕获）
             try:
-                await client.disconnect()
-            except Exception:
-                pass
-            # 强制重置连接标志 — disconnect() 可能因 is_initialized=True 而失败，
-            # 但我们需要让 start()→connect() 能重新建立连接
+                stop_task.result()
+            except Exception as e:
+                logger.warning(f"client.stop() during reconnect failed (continuing): {e}")
+                client.is_connected = False
+                _force_release_session_lock(client)
+        except asyncio.TimeoutError:
+            logger.error(
+                "client.stop() not finished within 30s (hard timeout) — "
+                "abandoning reconnect, returning False (workers stay alive)"
+            )
+            # 不 cancel stop_task（Pyrogram 会吞 CancelledError，cancel 不掉还
+            # 会污染日志）。让它留在后台，is_connected 强制置 False。
             client.is_connected = False
-            # 关键：stop() 超时后 SQLite EXCLUSIVE 锁可能未释放，
-            # 导致后续 start() 报 "database is locked"。
-            # 手动清理：1) 删除 journal 文件 2) 重置 session 引用
             _force_release_session_lock(client)
+            return False  # 关键：不执行 start()，避免迟到 stop() 杀新连接
         except Exception as e:
-            logger.warning(f"client.stop() during reconnect failed (continuing): {e}")
+            # Event.wait 被取消等意外情况——同样放弃，不碰 start()
+            logger.error(f"reconnect stop-phase interrupted: {e}, abandoning")
             client.is_connected = False
             _force_release_session_lock(client)
+            return False
 
         # start() 加 30s 超时 — 防止 start() 在未清理干净的 session 上 hang
+        # 9-23 批次3：start() 同样用 Event 硬超时（与 stop() 同款防护）
         logger.warning("Client auto-reconnect: start()...")
+        start_done = asyncio.Event()
+        start_task = asyncio.create_task(client.start())
+
+        def _start_finished(_t=None):
+            start_done.set()
+
+        start_task.add_done_callback(_start_finished)
         try:
-            await asyncio.wait_for(client.start(), timeout=30)
+            await asyncio.wait_for(start_done.wait(), timeout=30)
+            try:
+                start_task.result()
+            except asyncio.TimeoutError:
+                raise
+            except Exception as e:
+                error_str = str(e)
+                if "database is locked" in error_str:
+                    # 二次锁清理后重试一次
+                    logger.warning("client.start() failed with database is locked, forcing release and retrying...")
+                    _force_release_session_lock(client)
+                    retry_done = asyncio.Event()
+                    retry_task = asyncio.create_task(client.start())
+                    retry_task.add_done_callback(lambda _t: retry_done.set())
+                    try:
+                        await asyncio.wait_for(retry_done.wait(), timeout=30)
+                        retry_task.result()
+                        logger.success("Client reconnected successfully on retry — fresh TCP session established")
+                        _client_conn_errors["count"] = 0
+                        return True
+                    except Exception as e2:
+                        logger.error(f"client.start() retry also failed: {e2}")
+                        return False
+                logger.error(f"client.start() during reconnect failed: {e}")
+                return False
             logger.success("Client reconnected successfully — fresh TCP session established")
             _client_conn_errors["count"] = 0
             return True
         except asyncio.TimeoutError:
-            logger.error("client.start() timed out after 30s, reconnect failed")
-            return False
-        except Exception as e:
-            error_str = str(e)
-            if "database is locked" in error_str:
-                # 二次锁清理后重试一次
-                logger.warning(f"client.start() failed with database is locked, forcing release and retrying...")
-                _force_release_session_lock(client)
-                try:
-                    await asyncio.wait_for(client.start(), timeout=30)
-                    logger.success("Client reconnected successfully on retry — fresh TCP session established")
-                    _client_conn_errors["count"] = 0
-                    return True
-                except Exception as e2:
-                    logger.error(f"client.start() retry also failed: {e2}")
-            logger.error(f"client.start() during reconnect failed: {e}")
+            logger.error(
+                "client.start() not finished within 30s (hard timeout) — "
+                "abandoning reconnect, returning False"
+            )
             return False
     finally:
         _client_reconnecting["active"] = False
