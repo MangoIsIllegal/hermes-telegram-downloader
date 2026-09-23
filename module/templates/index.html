@@ -988,8 +988,10 @@
                 // Throttle elapsed: no local ticker, rely on server value
                 // (poll runs every 1.5s, server returns accurate elapsed)
                 // Pending list refreshes every 5 seconds
+                // 9-23 fix: 增量轮询（不带 reset）——reset 会清空已加载的
+                // 分页内容导致列表不停闪烁、永远只显示第一页
                 this.pendingPollTimer = setInterval(() => {
-                    this.fetchPending(true);
+                    this.pollPendingRefresh();
                     this.fetchFailed();
                 }, 5000);
                 // Completed: poll count only, fetch increment if new completions
@@ -1228,7 +1230,37 @@
 
             loadMorePending() {
                 if (this.activeTab !== 'pending') return;
-                this.fetchPending(true);
+                this.fetchPending();  // 追加下一页，不 reset
+            },
+
+            // 9-23: 轮询专用——只刷新已加载条目的状态（等待时间等），
+            // 不清空列表、不动 offset；新任务入库时通过 offset 差值检测
+            async pollPendingRefresh() {
+                if (this.pendingLoading) return;
+                try {
+                    // 已加载 N 条，重拉同区间 + 检查是否有新任务插队
+                    const res = await fetch(`/get_pending_list?offset=0&limit=${Math.max(this.pendingOffset, this.pendingLimit)}`);
+                    const data = await res.json();
+                    const tasks = data.tasks || data || [];
+                    const total = data.total ?? this.pendingTotal;
+                    // 前端持久字段（task_id → task）保序合并
+                    const byId = {};
+                    tasks.forEach(t => { byId[t.task_id] = t; });
+                    // 更新已有 + 移除消失的（被消费/被删），保序
+                    this.pendingTasks = this.pendingTasks
+                        .filter(t => byId[t.task_id])
+                        .map(t => byId[t.task_id]);
+                    // 头部插入新任务（队列 FIFO，新任务在尾部？——按 created_ts 排序，
+                    // 已加载区间内的新条目直接补进映射）
+                    const loadedIds = new Set(this.pendingTasks.map(t => t.task_id));
+                    const freshInView = tasks.filter(t => !loadedIds.has(t.task_id));
+                    if (freshInView.length) {
+                        // 新任务出现在已加载区间内（页尾追加，保持 created_ts 顺序）
+                        this.pendingTasks = [...this.pendingTasks, ...freshInView];
+                        this.pendingOffset += freshInView.length;
+                    }
+                    this.pendingTotal = total;
+                } catch(e) {}
             },
 
             async removePending(taskId) {
