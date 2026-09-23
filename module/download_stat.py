@@ -33,7 +33,9 @@ _download_lock: asyncio.Lock = asyncio.Lock()  # 保护 _download_result / _tota
 # 任务进度心跳 — 每次 Pyrogram 进度回调更新，worker watchdog 检测长时间无进度
 # 只杀"死任务"（连接断了，无任何数据回调），不杀"慢任务"（有回调但在慢下载）
 _task_heartbeat: dict = {}  # composite_key → last progress timestamp
-_TASK_HEARTBEAT_TIMEOUT = 300  # 5 分钟无进度回调判定为死连接
+# 9-24 watchdog 降级：此常量现在是"告警阈值"而非"判死阈值"——
+# 超过只记日志（silent throttle S1），30min 僵尸兜底在 media_downloader.py
+_TASK_HEARTBEAT_TIMEOUT = 300
 
 # 静默限速检测状态机
 # IDLE(since=0,notified=False) → 速度<阈值 → SLOW_PENDING(since=T,notified=False)
@@ -117,8 +119,9 @@ def clear_task_heartbeat(composite_key: str):
 def touch_task_heartbeat(composite_key: str):
     """Touch a task's heartbeat timestamp without changing download progress.
 
-    9-23 批次3：用于"活的等待"——resume 退避等合法长等待期间让 watchdog
-    知道任务还活着（watchdog 只认心跳时间戳，不认下载进度）。
+    9-23 批次3 引入（resume 退避期间防 watchdog 误杀）。
+    9-24 watchdog 降级后已无调用方——watchdog 不再因无心跳 cancel，
+    退避等待直接 sleep 即可。函数保留作为心跳工具（当前无人使用）。
     """
     if composite_key:
         _task_heartbeat[composite_key] = time.time()
@@ -336,6 +339,13 @@ async def update_download_status(
 
     # 更新进度心跳 — worker watchdog 用这个检测死连接
     _task_heartbeat[composite_key] = cur_time
+    # 9-24 S1+ 重启器数据源：全局最近进度时间（watchdog 降级后心跳回归
+    # 纯"下载进度"语义，不再被 touch 污染）
+    try:
+        import media_downloader as _md
+        _md._throttle_state["last_progress"] = cur_time
+    except Exception:
+        pass
 
     async with _download_lock:
         if not _download_result.get(chat_id):

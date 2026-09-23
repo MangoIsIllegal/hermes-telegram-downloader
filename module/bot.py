@@ -283,6 +283,19 @@ class DownloadBot:
                 elif value.is_running and not value.is_finish() and not value.is_stop_transmission:
                     # 僵尸任务检测：任务运行中但 total_download_task 长时间不递增
                     # 说明 worker 异常退出后 task_node 未被清理
+                    # 9-24 watchdog 降级配套：S1 静默限速挂起时任务合法无进展
+                    # （watchdog 不再 cancel），1h sweep 需豁免"最近有下载进度
+                    # 心跳"的任务——心跳新于 idle 窗口 = 任务活着，跳过。
+                    try:
+                        from module.download_stat import get_task_heartbeat_age
+                        _hb_age = get_task_heartbeat_age(
+                            f"{value.chat_id}_{value.task_id}"
+                        )
+                    except Exception:
+                        _hb_age = -1
+                    # 心跳存在且新于 1h → 有进度回调，任务活跃，豁免
+                    if 0 <= _hb_age < 3600:
+                        continue
                     idle_time = time.time() - value.last_reply_time
                     if idle_time > 3600:  # 1小时无进展
                         logger.warning(

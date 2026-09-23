@@ -69,6 +69,17 @@ _main_client_ref = {"client": None}  # set in start_server()
 _active_downloads = 0  # 内存计数器：当前正在下载的任务数（worker pick up +1, 完成/失败/cancel -1）
                        # 替代 get_downloading_tasks() JSON 读写做并发守卫，消除 TOCTOU 竞态
 
+# --- 9-24 S1+ 静默限速超时重启器（用户方案）---
+# 静默限速持续超过阈值时，断开节点重连一次（等效手动重启节点/v2rayA
+# 切换），有时能重置 TG 侧限速状态。全局一个计时器：限速是账号/节点级
+# 的，避免多任务各自触发重连打架。
+_THROTTLE_RESTART_AFTER = 24 * 3600  # 24h 无任何下载进度
+_THROTTLE_RESTART_MAX = 3            # 连续 N 次重连无效后只告警不再自动重连
+_throttle_state = {
+    "last_progress": 0.0,   # 最近一次任何任务的进度心跳时间（0=未初始化）
+    "restarts": 0,          # 本轮连续重启次数（有进度即清零）
+}
+
 # --- 动态 worker 池（9-21）：WebUI 改 max_download_task 不重启即时生效 ---
 import threading as _threading
 _worker_pool_lock = _threading.Lock()
@@ -787,20 +798,10 @@ async def download_media(
                             f"backoff {_backoff}s (does NOT consume download retries)"
                         )
                         error_message = f"续传网络错误，退避{_backoff}秒"
-                        # 9-23 批次3：退避等待是"活的等待"（批次1 引入的合法
-                        # 长等待），watchdog 只认心跳，300s 大退避会被误杀
-                        # （23:00 事故 task 0916-32）。分段 sleep 并周期性
-                        # touch 心跳，让 watchdog 知道任务还活着。
-                        _waited = 0
-                        while _waited < _backoff:
-                            _chunk = min(30, _backoff - _waited)
-                            await asyncio.sleep(_chunk)
-                            _waited += _chunk
-                            try:
-                                from module.download_stat import touch_task_heartbeat
-                                touch_task_heartbeat(composite_key)
-                            except Exception:
-                                pass
+                        # 9-24 watchdog 降级后：退避等待不再需要 touch 心跳
+                        # 防误杀（watchdog 不再因无心跳 cancel），心跳回归
+                        # 纯"下载进度"语义
+                        await asyncio.sleep(_backoff)
                         retry -= 1  # while 循环：本轮不消耗下载重试
                         continue
                     error_message = f"续传失败: {str(resume_err)[:60]}"
@@ -1047,8 +1048,9 @@ async def download_media(
             else:
                 # 普通连接错误，指数退避：10s, 60s, 300s
                 # 9-23 判死审计批次2：上限从 40s 提到 300s——代理故障恢复
-                # 常需数分钟，40s 上限对连续故障基本必死。300s 退避期间
-                # watchdog 兜底（心跳超时 cancel → requeue → 续传接手）
+                # 常需数分钟，40s 上限对连续故障基本必死。
+                # 9-24 watchdog 降级后：退避期间任务挂着等即可，
+                # 无 watchdog cancel 兜底（僵尸兜底 30min 才触发）
                 backoff = [10, 60, 300][min(retry, 2)]
             _client_conn_errors["count"] += 1
             if await _maybe_reconnect_client():
@@ -1179,10 +1181,11 @@ def _check_config() -> bool:
 async def worker(client: pyrogram.client.Client):
     """Work for download task
 
-    进度心跳机制：download_task 在独立 Task 中执行，watchdog 每 30s 检查
-    _task_heartbeat。如果某任务超过 _TASK_HEARTBEAT_TIMEOUT(300s) 没有任何
-    Pyrogram 进度回调，说明连接已死（不是慢），cancel 该任务释放 worker。
-    慢下载（有进度回调）不受影响。
+    9-24 watchdog 降级版：download_task 在独立 Task 中执行，worker 每 30s
+    检查 _task_heartbeat。静默限速(S1)/断流退避(S2)造成的长时间无进度
+    只记告警日志（5min 限频），不 cancel——保持任务持续挂起下载。
+    仅当 30 分钟(_ZOMBIE_TIMEOUT) 无任何进度时才认定协程僵尸挂死
+    （无异常抛出的真死 TCP），cancel 后走重连+requeue 续传。
     """
     from module.download_stat import (
         _TASK_HEARTBEAT_TIMEOUT, get_task_heartbeat_age, clear_task_heartbeat,
@@ -1222,29 +1225,50 @@ async def worker(client: pyrogram.client.Client):
                 target_client = node.client if node.client else client
                 composite_key = f"{node.chat_id}_{message.id}"
 
-                # 用 Task 包裹 download_task，配合心跳 watchdog 检测死连接
+                # 用 Task 包裹 download_task，配合心跳 watchdog（9-24 降级版）
                 dl_task = asyncio.create_task(
                     download_task(target_client, message, node)
                 )
                 dl_task_start = time.time()
-                _MAX_TASK_RUNTIME = 300  # 5分钟最大运行时间（心跳从未设置时的后备超时）
+                # 9-24 watchdog 重构（方案 v1，用户批准）：
+                # 静默限速(S1)与死TCP在应用层都表现为"无心跳"，原 300s cancel
+                # 是持续误杀——S1 场景任务本该挂着等。降级为两层：
+                #   1) 300s 无心跳 → 只记告警（5min 限频），绝不 cancel
+                #   2) 30min 无心跳且无退避标记 → 僵尸兜底 cancel（唯一覆盖
+                #      "socket 挂死且不抛异常"的残余场景；正常死 TCP 会先被
+                #      pyrogram TCP.TIMEOUT=900s 抛异常走异常分支）
+                _ZOMBIE_TIMEOUT = 1800  # 30min：僵尸协程兜底（远超 TCP.TIMEOUT 900s）
+                _last_warn = 0.0
                 watchdog_triggered = False
                 try:
                     while not dl_task.done():
-                        await asyncio.sleep(30)  # 每 30s 检查一次心跳
+                        await asyncio.sleep(30)
                         if dl_task.done():
                             break
                         age = get_task_heartbeat_age(composite_key)
-                        runtime = time.time() - dl_task_start
-                        if age > _TASK_HEARTBEAT_TIMEOUT or (age < 0 and runtime > _MAX_TASK_RUNTIME):
-                            logger.error(
-                                f"Worker: task {node.task_id_display} (msg {message.id}) "
-                                f"no progress for {int(age)}s (>{_TASK_HEARTBEAT_TIMEOUT}s), "
-                                f"cancelling — likely dead TCP connection"
-                            )
-                            dl_task.cancel()
-                            watchdog_triggered = True
-                            break
+                        # 心跳不存在(age=-1) = 任务还在启动/退避前段，不算异常
+                        if age < 0:
+                            continue
+                        if age > _TASK_HEARTBEAT_TIMEOUT:
+                            now = time.time()
+                            # 告警限频 5 分钟一条，S1 静默限速期间持续可见
+                            if now - _last_warn >= 300:
+                                logger.warning(
+                                    f"Worker: task {node.task_id_display} (msg {message.id}) "
+                                    f"no progress for {int(age)}s — likely silent throttle "
+                                    f"(S1), keep waiting (no cancel)"
+                                )
+                                _last_warn = now
+                            # 30min 僵尸兜底：超过即认定协程挂死（无异常抛出的真死）
+                            if age > _ZOMBIE_TIMEOUT:
+                                logger.error(
+                                    f"Worker: task {node.task_id_display} (msg {message.id}) "
+                                    f"no progress for {int(age)}s (>{_ZOMBIE_TIMEOUT}s zombie "
+                                    f"threshold), cancelling — coroutine hung with no exception"
+                                )
+                                dl_task.cancel()
+                                watchdog_triggered = True
+                                break
                     # 等待 dl_task 完成（正常结束或 cancel）
                     await dl_task
                     # 正常完成 → 清理重试计数
@@ -1253,9 +1277,9 @@ async def worker(client: pyrogram.client.Client):
                     # dl_task 被 cancel 时 await 会抛 CancelledError
                     if watchdog_triggered:
                         logger.warning(
-                            f"Worker: task {node.task_id_display} cancelled by heartbeat watchdog"
+                            f"Worker: task {node.task_id_display} cancelled by zombie watchdog"
                         )
-                        # 心跳超时说明 TCP 连接已死，递增错误计数
+                        # 僵尸判定 = 协程挂死（大概率死 TCP），递增错误计数
                         _client_conn_errors["count"] += 3
                         # 同步等待重连结果（不是 fire-and-forget）
                         # 9-23 修复：重连进行中时 bounded-wait 等结果，
@@ -1269,7 +1293,7 @@ async def worker(client: pyrogram.client.Client):
                             _watchdog_retry_count[node.task_id] = retry_count + 1
                             logger.info(
                                 f"Worker: requeue task {node.task_id_display} "
-                                f"(retry {retry_count + 1}/{_MAX_WATCHDOG_RETRIES}) after watchdog cancel + reconnect"
+                                f"(retry {retry_count + 1}/{_MAX_WATCHDOG_RETRIES}) after zombie cancel + reconnect"
                             )
                             await _reset_task_for_retry(node, message)
                             clear_task_heartbeat(composite_key)
@@ -1281,9 +1305,9 @@ async def worker(client: pyrogram.client.Client):
                         else:
                             # 重连失败或重试次数用完 → 移到失败列表
                             if not reconnect_ok:
-                                err_msg = "下载超时被watchdog取消（重连失败）"
+                                err_msg = "任务僵死被watchdog取消（重连失败）"
                             else:
-                                err_msg = f"下载超时被watchdog取消（重试{_MAX_WATCHDOG_RETRIES}次后仍失败）"
+                                err_msg = f"任务僵死被watchdog取消（重试{_MAX_WATCHDOG_RETRIES}次后仍失败）"
                             logger.warning(
                                 f"Worker: moving task {node.task_id_display} to failed: {err_msg}"
                             )
@@ -1672,6 +1696,68 @@ async def _maybe_reconnect_client(force=False):
     return True
 
 
+async def _throttle_restart_loop(client):
+    """9-24 S1+ 静默限速超时重启器（用户方案第 2 条）。
+
+    每 10 分钟检查一次全局下载进度：
+    - 有下载中任务 且 全局无进度 ≥ 24h → 断开重连一次（等效手动重启节点）
+    - 重连后仍有进度 → 计数清零；连续 3 次无效 → 停止自动重启，仅告警
+    """
+    from module.download_stat import get_download_result
+
+    # 启动时初始化基线（避免容器重启后立即误判"无进度 24h"）
+    while _throttle_state["last_progress"] == 0.0:
+        await asyncio.sleep(60)
+    while True:
+        try:
+            await asyncio.sleep(600)  # 10 分钟检查周期
+            # 只在有活跃下载任务时计时（队列空了不算限速）
+            dr = get_download_result()
+            active = 0
+            for _chat, msgs in dr.items():
+                for _mid, v in msgs.items():
+                    if 0 < v.get("down_byte", 0) < v.get("total_size", 0):
+                        active += 1
+                        break
+                if active:
+                    break
+            if not active:
+                # 无活跃任务：重置计时基线，防止"下完了挂一整天"误触发
+                _throttle_state["last_progress"] = time.time()
+                continue
+            silent = time.time() - _throttle_state["last_progress"]
+            if silent < _THROTTLE_RESTART_AFTER:
+                continue
+            if _throttle_state["restarts"] >= _THROTTLE_RESTART_MAX:
+                logger.warning(
+                    f"Throttle-restart: silent {int(silent/3600)}h, "
+                    f"{_throttle_state['restarts']} restarts already tried without "
+                    f"progress — manual node change suggested (no more auto-restarts)"
+                )
+                continue
+            logger.warning(
+                f"Throttle-restart: no download progress for {int(silent/3600)}h "
+                f"({active} active tasks) — restarting node connection "
+                f"(attempt {_throttle_state['restarts'] + 1}/{_THROTTLE_RESTART_MAX})"
+            )
+            _throttle_state["restarts"] += 1
+            # 重连前把基线推到现在，防止重连失败后立即再触发
+            _throttle_state["last_progress"] = time.time()
+            ok = await _reconnect_client()
+            if ok:
+                logger.success(
+                    "Throttle-restart: node connection restarted — "
+                    "watching for progress to confirm throttle reset"
+                )
+            else:
+                logger.error("Throttle-restart: reconnect failed, will retry next cycle")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"throttle_restart_loop error: {e}")
+            await asyncio.sleep(60)
+
+
 async def stop_server(client: pyrogram.Client):
     """Stop the server"""
     await client.stop()
@@ -1777,6 +1863,8 @@ def main():
             with _worker_pool_lock:
                 _live_workers += 1
             tasks.append(app.loop.create_task(worker(client)))
+        # 9-24 S1+ 静默限速重启器（方案改动 3）
+        tasks.append(app.loop.create_task(_throttle_restart_loop(client)))
         if app.bot_token:
             app.loop.run_until_complete(start_download_bot(app, client, add_download_task, download_chat_task))
         _exec_loop()
