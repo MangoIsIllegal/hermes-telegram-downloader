@@ -752,32 +752,36 @@ async def download_media(
                         f"{type(resume_err).__name__}: {str(resume_err)[:100]}, "
                         f"retry with fresh reference (temp preserved)"
                     )
-                    # 9-23 修复（Jayinne 2小时下载被3秒抖动判死）：
-                    # get_file 静默断流是网络抖动，不是逻辑错误——
-                    # 不能消耗 3 次 retry 配额（919478 有效下载2小时后
-                    # 连续断流 3×3s 烧完配额被判死，1017MB 断点闲置）。
-                    # 断流走独立退避预算：15s/30s/60s/120s/300s/600s/900s...
-                    # 最多 10 次（约 50 分钟等待窗口），其他异常照旧 3 次。
-                    if isinstance(resume_err, ConnectionError) and "stream ended early" in str(resume_err):
-                        _stream_retry = getattr(node, "_stream_ended_retries", 0) + 1
-                        node._stream_ended_retries = _stream_retry
-                        if _stream_retry > 10:
+                    # 9-23 修复（判死审计批次1）：网络类异常与逻辑错误同权，
+                    # 3×3s 对网络抖动基本必死。识别网络类异常走独立退避，
+                    # 不消耗 3 次下载重试（与 stream ended early 同策略）。
+                    _err_str = str(resume_err)
+                    _is_network_err = (
+                        isinstance(resume_err, (ConnectionError, TimeoutError, OSError))
+                        or "timed out" in _err_str.lower()
+                        or "timeout" in _err_str.lower()
+                        or "connection" in _err_str.lower()
+                        or "flood" in _err_str.lower()
+                    )
+                    if _is_network_err:
+                        _net_retry = getattr(node, "_resume_net_retries", 0) + 1
+                        node._resume_net_retries = _net_retry
+                        if _net_retry > 8:
                             logger.error(
                                 f"Message[{message.id}] {ui_file_name}: "
-                                f"stream ended early x{_stream_retry}, giving up (temp preserved)"
+                                f"resume network error x{_net_retry}, giving up (temp preserved)"
                             )
-                            error_message = f"续传断流超限（{str(resume_err)[:60]}）"
+                            error_message = f"续传网络错误超限（{str(resume_err)[:60]}）"
                             break
-                        _backoff = min(15 * (2 ** (_stream_retry - 1)), 900)
+                        _backoff = min(15 * (2 ** (_net_retry - 1)), 600)
                         logger.warning(
                             f"Message[{message.id}] {ui_file_name}: "
-                            f"stream ended early (retry {_stream_retry}/10), "
+                            f"resume network error (retry {_net_retry}/8), "
                             f"backoff {_backoff}s (does NOT consume download retries)"
                         )
-                        error_message = f"续传断流，退避{_backoff}秒"
+                        error_message = f"续传网络错误，退避{_backoff}秒"
                         await asyncio.sleep(_backoff)
-                        # while 循环：回退 retry 游标 → 本轮不消耗下载重试
-                        retry -= 1
+                        retry -= 1  # while 循环：本轮不消耗下载重试
                         continue
                     error_message = f"续传失败: {str(resume_err)[:60]}"
                     await asyncio.sleep(RETRY_TIME_OUT)
@@ -792,7 +796,19 @@ async def download_media(
                     f"temp preserved, retrying"
                 )
                 error_message = "续传跳过：刷新消息中无媒体"
+                # 9-23 判死审计批次1：与网络类异常同策略——单独计数防死循环，
+                # 不空耗 3 次配额（每次 sleep 3s 后 retry 前进）
+                _skip_retry = getattr(node, "_resume_skip_retries", 0) + 1
+                node._resume_skip_retries = _skip_retry
+                if _skip_retry > 6:
+                    logger.error(
+                        f"Message[{message_id}] {ui_file_name}: "
+                        f"resume skipped x{_skip_retry}, giving up (temp preserved)"
+                    )
+                    error_message = "续传跳过超限（刷新消息中持续无媒体）"
+                    break
                 await asyncio.sleep(RETRY_TIME_OUT)
+                retry -= 1  # 本轮不消耗下载重试
                 continue
         if _resume_attempted and _pyrogram_temp and os.path.exists(_pyrogram_temp) \
                 and os.path.getsize(_pyrogram_temp) > 0:
@@ -804,7 +820,19 @@ async def download_media(
                 f"({os.path.getsize(_pyrogram_temp)} bytes), retrying"
             )
             error_message = "保护断点，等待续传"
+            # 9-23 判死审计批次1：与 resume skipped 同策略——独立计数，
+            # 不空耗 3 次配额
+            _prot_retry = getattr(node, "_protect_retries", 0) + 1
+            node._protect_retries = _prot_retry
+            if _prot_retry > 6:
+                logger.error(
+                    f"Message[{message_id}] {ui_file_name}: "
+                    f"protect-block x{_prot_retry}, giving up (temp preserved)"
+                )
+                error_message = "保护断点拦截超限（续传持续未完成）"
+                break
             await asyncio.sleep(RETRY_TIME_OUT)
+            retry -= 1  # 本轮不消耗下载重试
             continue
         try:
             temp_download_path = await client.download_media(
