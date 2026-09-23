@@ -127,9 +127,9 @@
                                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
                                         </svg>
                                         待下载
-                                        <span x-show="pendingTasks.length > 0"
+                                        <span x-show="pendingTotal > 0"
                                               class="pulse-badge inline-flex items-center gap-1 px-2 py-0.5 text-xs font-bold rounded-md bg-amber-500 text-white min-w-[1.5rem] justify-center"
-                                              x-text="pendingTasks.length"></span>
+                                              x-text="pendingTotal"></span>
                                     </span>
                                 </button>
                                 <button
@@ -516,6 +516,12 @@
                                             <span class="text-xs text-gray-400" x-text="'接收于 ' + task.created_at"></span>
                                         </span>
                                     </template>
+                            <!-- 9-23: 待下载分页加载指示 -->
+                            <div x-show="pendingLoading" class="text-center py-3 text-sm text-gray-400">加载中...</div>
+                            <div x-show="!pendingHasMore && pendingTasks.length > 0" class="text-center py-3 text-xs text-gray-300">已全部加载</div>
+                            <div x-show="pendingHasMore && pendingTasks.length > 0 && !pendingLoading" class="text-center py-3">
+                                <button @click="loadMorePending()" class="text-sm text-blue-500 hover:text-blue-600">加载更多</button>
+                            </div>
                                 </div>
                                 <h4 class="text-sm font-medium text-gray-900 line-clamp-2" :title="task.filename" x-text="task.filename"></h4>
                                 <div class="flex items-center gap-3 mt-1.5 text-xs text-gray-500">
@@ -857,7 +863,7 @@
                                     <svg class="w-4 h-4 text-gray-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.172 16.172a4 4 0 015.656 0M9 10h.01M15 10h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
                                     </svg>
-                                    <span class="text-sm text-gray-500">本地文件已不存在</span>
+                                    <span class="text-sm text-gray-500" x-text="deleteModal.checkFailed ? '文件状态检查失败（网络波动），可重试打开' : '本地文件已不存在'"></span>
                                 </div>
                             </template>
                         </div>
@@ -925,6 +931,11 @@
             completedLoading: false,
             failedTasks: [],
             pendingTasks: [],
+            pendingOffset: 0,
+            pendingLimit: 100,
+            pendingHasMore: true,
+            pendingLoading: false,
+            pendingTotal: 0,
             allTasks: [],
             selectedTasks: [],
             completedSearch: '',
@@ -939,6 +950,7 @@
                 isBatch: false,
                 taskIds: [],
                 fileExists: false,
+                checkFailed: false,
                 filename: '',
                 filePath: '',
                 deleteFile: false,
@@ -959,7 +971,7 @@
                 await this.fetchVersion();
                 await this.fetchDownloadState();
                 await this.fetchActive();
-                await this.fetchPending();
+                await this.fetchPending(true);
                 await this.fetchCompleted(true);
                 await this.fetchMaxWorkers();
                 this.pollTimer = setInterval(() => {
@@ -977,7 +989,7 @@
                 // (poll runs every 1.5s, server returns accurate elapsed)
                 // Pending list refreshes every 5 seconds
                 this.pendingPollTimer = setInterval(() => {
-                    this.fetchPending();
+                    this.fetchPending(true);
                     this.fetchFailed();
                 }, 5000);
                 // Completed: poll count only, fetch increment if new completions
@@ -990,13 +1002,20 @@
             },
 
             onScroll() {
-                if (this.activeTab !== 'completed') return;
-                if (this.completedLoading || !this.completedHasMore) return;
                 const scrollTop = document.documentElement.scrollTop;
                 const scrollHeight = document.documentElement.scrollHeight;
                 const clientHeight = document.documentElement.clientHeight;
-                if (scrollTop + clientHeight >= scrollHeight - 300) {
-                    this.loadMoreCompleted();
+                if (this.activeTab === 'completed') {
+                    if (this.completedLoading || !this.completedHasMore) return;
+                    if (scrollTop + clientHeight >= scrollHeight - 300) {
+                        this.loadMoreCompleted();
+                    }
+                } else if (this.activeTab === 'pending') {
+                    // 9-23: 待下载页无限加载（对齐已完成页）
+                    if (this.pendingLoading || !this.pendingHasMore) return;
+                    if (scrollTop + clientHeight >= scrollHeight - 300) {
+                        this.loadMorePending();
+                    }
                 }
             },
 
@@ -1183,12 +1202,33 @@
                 } catch(e) {}
             },
 
-            async fetchPending() {
+            async fetchPending(reset = false) {
+                if (reset) {
+                    this.pendingTasks = [];
+                    this.pendingOffset = 0;
+                    this.pendingHasMore = true;
+                }
+                if (this.pendingLoading || !this.pendingHasMore) return;
+                this.pendingLoading = true;
                 try {
-                    const res = await fetch('/get_pending_list');
+                    const res = await fetch(`/get_pending_list?offset=${this.pendingOffset}&limit=${this.pendingLimit}`);
                     const data = await res.json();
-                    this.pendingTasks = data;
+                    const tasks = data.tasks || data || [];
+                    const existingIds = new Set(this.pendingTasks.map(t => t.task_id));
+                    const fresh = tasks.filter(t => !existingIds.has(t.task_id));
+                    this.pendingTasks = [...this.pendingTasks, ...fresh];
+                    this.pendingOffset += tasks.length;
+                    this.pendingTotal = data.total ?? this.pendingTasks.length;
+                    if (tasks.length < this.pendingLimit) {
+                        this.pendingHasMore = false;
+                    }
                 } catch(e) {}
+                this.pendingLoading = false;
+            },
+
+            loadMorePending() {
+                if (this.activeTab !== 'pending') return;
+                this.fetchPending(true);
             },
 
             async removePending(taskId) {
@@ -1197,7 +1237,7 @@
                     const data = await res.json();
                     if (data.code === '1') {
                         this.showToast('已移除待下载任务', 'success');
-                        this.fetchPending().catch(() => {});
+                        this.fetchPending(true).catch(() => {});
                     } else {
                         this.showToast(data.message || '移除失败', 'error');
                     }
@@ -1289,7 +1329,7 @@
                         // 刷新页面数据，静默失败不弹错误（重试已成功）
                         this.fetchActive().catch(() => {});
                         this.fetchCompleted().catch(() => {});
-                        this.fetchPending().catch(() => {});
+                        this.fetchPending(true).catch(() => {});
                     } else {
                         this.showToast(data.message || '批量重试失败', 'error');
                     }
@@ -1334,6 +1374,7 @@
                     isBatch: false,
                     taskIds: [taskId],
                     fileExists: false,
+                    checkFailed: false,
                     filename: '',
                     filePath: '',
                     deleteFile: false,
@@ -1358,6 +1399,7 @@
                     // fall back to "file unknown" state so user can still confirm
                     console.error('check_file_exists failed:', e);
                     this.deleteModal.fileExists = false;
+                    this.deleteModal.checkFailed = true;
                     this.deleteModal.deleteFile = false;
                 }
                 this.deleteModal.loading = false;
@@ -1543,7 +1585,7 @@
                         // 刷新页面数据，静默失败不弹错误（重试已成功）
                         this.fetchActive().catch(() => {});
                         this.fetchCompleted().catch(() => {});
-                        this.fetchPending().catch(() => {});
+                        this.fetchPending(true).catch(() => {});
                     } else {
                         this.showToast(data.message || '重试失败', 'error');
                     }

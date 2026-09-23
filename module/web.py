@@ -241,6 +241,12 @@ def get_download_list():
                 # downloading yet. Only show tasks with real progress data.
                 if value.get("total_size", 0) == 0 and value.get("down_byte", 0) == 0:
                     continue
+                # 9-23 性能修复：过滤已完成任务。历史 completed（3500+条）
+                # 常驻内存且 down_byte==total_size，此前全部随本端点吐出
+                # （2.9MB/次、每秒轮询）——WebUI 卡顿与 fail to fetch 元凶。
+                # 已完成列表走 already_down=true 分页端点，此处只回真活跃。
+                if is_already_down:
+                    continue
 
             progress = value.get("progress", 0)
             if not progress and value["total_size"] > 0:
@@ -732,7 +738,14 @@ def web_get_pending_list():
 
     # Sort by created_at ascending (earliest first)
     result.sort(key=lambda x: x.get("created_ts", 0))
-    return jsonify(result)
+
+    # 9-23 分页（对齐已完成页）：默认 limit=100，避免 1600+ 条待下载
+    # 全量序列化拖慢响应。前端滚动到底部带 offset 加载下一页。
+    offset = request.args.get("offset", 0, type=int)
+    limit = request.args.get("limit", 100, type=int)
+    total = len(result)
+    page = result[offset : offset + limit] if limit > 0 else result[offset:]
+    return jsonify({"tasks": page, "total": total})
 
 
 @_flask_app.route("/remove_pending", methods=["POST"])
