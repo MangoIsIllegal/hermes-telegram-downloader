@@ -1157,7 +1157,11 @@ async def worker(client: pyrogram.client.Client):
                         # 心跳超时说明 TCP 连接已死，递增错误计数
                         _client_conn_errors["count"] += 3
                         # 同步等待重连结果（不是 fire-and-forget）
+                        # 9-23 修复：重连进行中时 bounded-wait 等结果，
+                        # 不再立即 False 判死（0916-29 误判根因）
                         reconnect_ok = await _maybe_reconnect_client(force=True)
+                        if not reconnect_ok:
+                            reconnect_ok = await _wait_for_reconnect_result(timeout=45)
                         retry_count = _watchdog_retry_count.get(node.task_id, 0)
                         if reconnect_ok and retry_count < _MAX_WATCHDOG_RETRIES:
                             # 重连成功 + 还有重试次数 → 重新入队
@@ -1457,6 +1461,31 @@ def _force_release_session_lock(client):
         logger.warning(f"Failed to release session lock: {e}")
 
 
+async def _wait_for_reconnect_result(timeout: float = 45.0) -> bool:
+    """Bounded-wait for an in-flight reconnect to finish and report its result.
+
+    9-23 fix (0916-29 误判): two tasks watchdog-cancelled in the same second —
+    the first starts the reconnect, the second gets "already in progress,
+    skipping" → immediate False → task moved to failed while the reconnect
+    actually SUCCEEDED 260ms later. Returning False immediately permanently
+    discards recoverable tasks. This helper polls the in-flight reconnect
+    (and client connection state) for up to `timeout` seconds before giving up.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _client_reconnecting["active"]:
+            # In-flight reconnect finished — report actual connection state
+            client = _main_client_ref.get("client")
+            if client and getattr(client, "is_connected", False):
+                return True
+            # Reconnect finished but client still down — one more attempt
+            return await _maybe_reconnect_client(force=True)
+        await asyncio.sleep(2)
+    # Timeout waiting — final state check
+    client = _main_client_ref.get("client")
+    return bool(client and getattr(client, "is_connected", False))
+
+
 async def _maybe_reconnect_client(force=False):
     """Check if consecutive connection errors warrant a client reconnect.
 
@@ -1477,7 +1506,6 @@ async def _maybe_reconnect_client(force=False):
         # Can't wait here (would block), so return False to be safe
         # Caller will move task to failed, which is correct — task can be retried later
         return False
-
     now = time.time()
     if not force and now - _client_last_reconnect["time"] < _CLIENT_RECONNECT_COOLDOWN:
         logger.debug(
