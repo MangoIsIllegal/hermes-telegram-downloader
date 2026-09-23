@@ -699,7 +699,12 @@ async def download_media(
 
     message_id = message.id
     total_wait = 0
-    for retry in range(3):
+    # 9-23 重构（Jayinne 2小时下载被3秒抖动判死）：for→while，
+    # retry 显式管理——stream ended early 断流走独立退避（不消耗
+    # 3 次下载重试），其他异常照旧推进 retry。
+    retry = -1
+    while retry < 2:
+        retry += 1
         # 断点续传（9-21 修复）：每次尝试前，若 pyrogram 断点文件存在且有数据，先续传。
         # pyrogram 实际写盘为 temp_file_name + ".temp"，检查必须带后缀。
         _pyrogram_temp = (temp_file_name + ".temp") if temp_file_name else None
@@ -747,6 +752,33 @@ async def download_media(
                         f"{type(resume_err).__name__}: {str(resume_err)[:100]}, "
                         f"retry with fresh reference (temp preserved)"
                     )
+                    # 9-23 修复（Jayinne 2小时下载被3秒抖动判死）：
+                    # get_file 静默断流是网络抖动，不是逻辑错误——
+                    # 不能消耗 3 次 retry 配额（919478 有效下载2小时后
+                    # 连续断流 3×3s 烧完配额被判死，1017MB 断点闲置）。
+                    # 断流走独立退避预算：15s/30s/60s/120s/300s/600s/900s...
+                    # 最多 10 次（约 50 分钟等待窗口），其他异常照旧 3 次。
+                    if isinstance(resume_err, ConnectionError) and "stream ended early" in str(resume_err):
+                        _stream_retry = getattr(node, "_stream_ended_retries", 0) + 1
+                        node._stream_ended_retries = _stream_retry
+                        if _stream_retry > 10:
+                            logger.error(
+                                f"Message[{message.id}] {ui_file_name}: "
+                                f"stream ended early x{_stream_retry}, giving up (temp preserved)"
+                            )
+                            error_message = f"续传断流超限（{str(resume_err)[:60]}）"
+                            break
+                        _backoff = min(15 * (2 ** (_stream_retry - 1)), 900)
+                        logger.warning(
+                            f"Message[{message.id}] {ui_file_name}: "
+                            f"stream ended early (retry {_stream_retry}/10), "
+                            f"backoff {_backoff}s (does NOT consume download retries)"
+                        )
+                        error_message = f"续传断流，退避{_backoff}秒"
+                        await asyncio.sleep(_backoff)
+                        # while 循环：回退 retry 游标 → 本轮不消耗下载重试
+                        retry -= 1
+                        continue
                     error_message = f"续传失败: {str(resume_err)[:60]}"
                     await asyncio.sleep(RETRY_TIME_OUT)
                     continue
