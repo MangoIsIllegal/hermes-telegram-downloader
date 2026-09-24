@@ -782,19 +782,37 @@ async def download_media(
                         or "flood" in _err_str.lower()
                     )
                     if _is_network_err:
+                        # 9-24 用户确认：网络类续传错误无限重试，永不判死
+                        # （诉求3：保持任务持续，直到消息不存在类才失败）。
+                        # 退避封顶 600s 防刷请求；30min 僵尸兜底会周期性
+                        # requeue 让任务换 worker，不存在永久占坑。
                         _net_retry = getattr(node, "_resume_net_retries", 0) + 1
                         node._resume_net_retries = _net_retry
-                        if _net_retry > 8:
-                            logger.error(
+                        # FloodWait/FloodPremiumWait：按服务器要求 sleep，
+                        # 不计任何计数（9-24 个案：13 秒 flood 攒 8 次被判死）
+                        import re as _re
+                        _fw_m = _re.search(
+                            r"FLOOD_(?:PREMIUM_)?WAIT_(\d+).*?wait of (\d+) seconds?",
+                            _err_str, _re.IGNORECASE,
+                        )
+                        if _fw_m:
+                            _fw = int(_fw_m.group(1) or _fw_m.group(2))
+                            _fw = min(_fw + 5, 3600)
+                            logger.warning(
                                 f"Message[{message.id}] {ui_file_name}: "
-                                f"resume network error x{_net_retry}, giving up (temp preserved)"
+                                f"resume FloodWait {_fw}s — sleeping, no retry counted"
                             )
-                            error_message = f"续传网络错误超限（{str(resume_err)[:60]}）"
-                            break
+                            _unified_flood_wait["until"] = time.time() + _fw + 5
+                            _unified_flood_wait["reason"] = (
+                                f"续传 FloodWait (msg {message.id})"
+                            )
+                            await asyncio.sleep(_fw)
+                            retry -= 1
+                            continue
                         _backoff = min(15 * (2 ** (_net_retry - 1)), 600)
                         logger.warning(
                             f"Message[{message.id}] {ui_file_name}: "
-                            f"resume network error (retry {_net_retry}/8), "
+                            f"resume network error (retry {_net_retry}), "
                             f"backoff {_backoff}s (does NOT consume download retries)"
                         )
                         error_message = f"续传网络错误，退避{_backoff}秒"
