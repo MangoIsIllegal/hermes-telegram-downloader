@@ -515,12 +515,6 @@
                                             <span class="text-xs text-gray-400" x-text="'接收于 ' + task.created_at"></span>
                                         </span>
                                     </template>
-                            <!-- 9-23: 待下载分页加载指示 -->
-                            <div x-show="pendingLoading" class="text-center py-3 text-sm text-gray-400">加载中...</div>
-                            <div x-show="!pendingHasMore && pendingTasks.length > 0" class="text-center py-3 text-xs text-gray-300">已全部加载</div>
-                            <div x-show="pendingHasMore && pendingTasks.length > 0 && !pendingLoading" class="text-center py-3">
-                                <button @click="loadMorePending()" class="text-sm text-blue-500 hover:text-blue-600">加载更多</button>
-                            </div>
                                 </div>
                                 <h4 class="text-sm font-medium text-gray-900 line-clamp-2" :title="task.filename" x-text="task.filename"></h4>
                                 <div class="flex items-center gap-3 mt-1.5 text-xs text-gray-500">
