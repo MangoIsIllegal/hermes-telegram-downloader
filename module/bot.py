@@ -2085,53 +2085,22 @@ async def _consume_one_pending():
                     msg = await asyncio.wait_for(client.get_messages(cid, int(msg_id)), timeout=300)
                 except asyncio.TimeoutError:
                     # TG 静默限速：get_messages 300s 超时
-                    # 连续超时计数 — 超过3次标失败，不再无限循环
+                    # 9-24 用户确认：永不判死（诉求3——300s×3 也只是
+                    # "TG 没响应"，不等于任务坏了；S1 静默限速可以挂
+                    # 24h+。改无限退避，任务保持 pending
                     _pending_timeout_counts[task_id] = _pending_timeout_counts.get(task_id, 0) + 1
                     consecutive = _pending_timeout_counts[task_id]
                     from module.pyrogram_extension import _unified_flood_wait
-                    if consecutive >= 3:
-                        # 连续3次超时（共~15分钟），连接已死，标失败
-                        logger.error(
-                            f"Pending consumer: get_messages TIMEOUT (300s) x{consecutive} for "
-                            f"chat {cid} msg {msg_id}, marking as FAILED"
-                        )
-                        _pending_timeout_counts.pop(task_id, None)
-                        try:
-                            from module.download_stat import add_failed_download
-                            add_failed_download(
-                                chat_id=cid, msg_id=msg_id,
-                                task_id=extra.get('task_id_display', str(task_id)),
-                                file_name="", error_message="获取消息超时（连续3次300s超时，连接已死）",
-                                total_size=0, source_link="",
-                                from_user_id=str(from_user_id) if from_user_id else "",
-                            )
-                        except Exception:
-                            pass
-                        remove_task(task_id)
-                        # 触发 client 重连 — 连续超时说明 TCP 已死
-                        from media_downloader import _maybe_reconnect_client
-                        asyncio.create_task(_maybe_reconnect_client())
-                        return
-                    # 未达3次，保持 pending，设递增 cooldown
-                    backoff = 60 * consecutive  # 60s, 120s, 180s
+                    backoff = min(60 * consecutive, 600)  # 60s→…→600s 封顶
                     _unified_flood_wait["until"] = time.time() + backoff + 5
                     _unified_flood_wait["reason"] = f"get_messages 超时疑似限速 chat {cid} msg {msg_id} (第{consecutive}次)"
-                    logger.warning(
-                        f"Pending consumer: get_messages TIMEOUT (300s) for chat {cid} msg {msg_id}, "
-                        f"setting {backoff}s cooldown. Task stays pending (consecutive timeout #{consecutive})."
-                    )
-                    if from_user_id and _bot and _bot.bot:
-                        try:
-                            notify_text = (
-                                "⏸️ TG 连接超时，疑似限速\n"
-                                f"任务: {extra.get('task_id_display', str(task_id))} 保持待执行\n"
-                                f"暂停 {backoff} 秒后自动重试（第{consecutive}次超时）\n"
-                                f"原因: get_messages 300s 超时"
-                            )
-                            await _bot.bot.send_message(int(from_user_id), notify_text)
-                        except Exception:
-                            pass
-                    return
+                    if consecutive % 5 == 1:
+                        logger.warning(
+                            f"Pending consumer: get_messages TIMEOUT (300s) x{consecutive} for "
+                            f"chat {cid} msg {msg_id}, backoff {backoff}s. "
+                            f"Task stays pending (never fails on network)."
+                        )
+                    return  # 保持 pending
                 except pyrogram.errors.exceptions.flood_420.FloodWait as e:
                     # Don't move to failed list — keep pending, set unified cooldown
                     wait_val = getattr(e, "value", 60)
@@ -2158,34 +2127,18 @@ async def _consume_one_pending():
                 except Exception as e:
                     # 防御性检测：如果异常是 TimeoutError 类型，按限速处理
                     if isinstance(e, TimeoutError):
+                        # 9-24 用户确认：永不判死（网络类只退避不预算）
                         _pending_timeout_counts[task_id] = _pending_timeout_counts.get(task_id, 0) + 1
                         consecutive = _pending_timeout_counts[task_id]
-                        backoff = 60 * consecutive
+                        backoff = min(60 * consecutive, 600)
                         from module.pyrogram_extension import _unified_flood_wait
                         _unified_flood_wait["until"] = time.time() + backoff + 5
                         _unified_flood_wait["reason"] = f"get_messages 连接超时疑似限速 chat {cid} msg {msg_id} (第{consecutive}次)"
-                        logger.warning(
-                            f"Pending consumer: TimeoutError for chat {cid} msg {msg_id}: {e}, "
-                            f"setting {backoff}s cooldown. Task stays pending (consecutive #{consecutive})."
-                        )
-                        if consecutive >= 3:
-                            # 连续3次超时，标失败并触发重连
-                            logger.error(f"Pending consumer: TimeoutError x{consecutive}, marking FAILED")
-                            _pending_timeout_counts.pop(task_id, None)
-                            try:
-                                from module.download_stat import add_failed_download
-                                add_failed_download(
-                                    chat_id=cid, msg_id=msg_id,
-                                    task_id=extra.get('task_id_display', str(task_id)),
-                                    file_name="", error_message=f"获取消息超时（连续{consecutive}次超时）",
-                                    total_size=0, source_link="",
-                                    from_user_id=str(from_user_id) if from_user_id else "",
-                                )
-                            except Exception:
-                                pass
-                            remove_task(task_id)
-                            from media_downloader import _maybe_reconnect_client
-                            asyncio.create_task(_maybe_reconnect_client())
+                        if consecutive % 5 == 1:
+                            logger.warning(
+                                f"Pending consumer: TimeoutError x{consecutive} for chat {cid} msg {msg_id}: {e}, "
+                                f"backoff {backoff}s. Task stays pending (never fails on network)."
+                            )
                         return  # 保持 pending，不 remove_task
                     # 9-23 判死审计批次2：网络类异常不再一次判死——
                     # 重连窗口期 "Client has not been started yet" 曾连环误杀
@@ -2200,40 +2153,26 @@ async def _consume_one_pending():
                         or "flood" in _net_err_str.lower()
                     )
                     if _is_net_err:
+                        # 9-24 用户确认：网络类 get_messages 失败永不判死
+                        # （诉求3：网络类只退避不预算）。删 3 次判死分支——
+                        # 断网期 pending consumer 每 3s 一轮，3 次仅需 9 秒，
+                        # 断网必死（0916-1124 死于 Connection lost x3）。
+                        # 改为无上限退避（60s→120s→180s 封顶 180s），
+                        # 任务保持 pending，网络恢复自动继续
                         _pending_timeout_counts[task_id] = _pending_timeout_counts.get(task_id, 0) + 1
                         consecutive = _pending_timeout_counts[task_id]
-                        if consecutive >= 3:
-                            logger.error(
-                                f"Pending consumer: get_messages network error x{consecutive} "
-                                f"for chat {cid} msg {msg_id}, marking as FAILED"
-                            )
-                            _pending_timeout_counts.pop(task_id, None)
-                            try:
-                                from module.download_stat import add_failed_download
-                                add_failed_download(
-                                    chat_id=cid, msg_id=msg_id,
-                                    task_id=extra.get('task_id_display', str(task_id)),
-                                    file_name="",
-                                    error_message=f"获取消息失败（连续{consecutive}次网络错误）: {_net_err_str[:80]}",
-                                    total_size=0, source_link="",
-                                    from_user_id=str(from_user_id) if from_user_id else "",
-                                )
-                            except Exception:
-                                pass
-                            remove_task(task_id)
-                            from media_downloader import _maybe_reconnect_client
-                            asyncio.create_task(_maybe_reconnect_client())
-                            return
-                        backoff = 60 * consecutive
+                        backoff = min(60 * consecutive, 180)
                         from module.pyrogram_extension import _unified_flood_wait
                         _unified_flood_wait["until"] = time.time() + backoff + 5
                         _unified_flood_wait["reason"] = (
                             f"get_messages 网络错误 chat {cid} msg {msg_id} (第{consecutive}次)"
                         )
-                        logger.warning(
-                            f"Pending consumer: get_messages network error for chat {cid} msg {msg_id}: {e}, "
-                            f"setting {backoff}s cooldown. Task stays pending (consecutive #{consecutive})."
-                        )
+                        if consecutive % 5 == 1:  # 限频告警：每5次记一条
+                            logger.warning(
+                                f"Pending consumer: get_messages network error x{consecutive} "
+                                f"for chat {cid} msg {msg_id}: {e}, "
+                                f"backoff {backoff}s. Task stays pending (never fails on network)."
+                            )
                         return  # 保持 pending，不 remove_task
                     logger.warning(f"Pending consumer: get_messages failed for chat {cid} msg {msg_id}: {e}, moving to failed")
                     try:
