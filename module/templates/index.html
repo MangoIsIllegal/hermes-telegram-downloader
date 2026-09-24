@@ -978,14 +978,10 @@
                     this.fetchFloodWait();
                     this.fetchActive();
                 }, 1000);
-                // FloodWait countdown ticker (updates every second for smooth countdown)
-                this.floodWaitTimer = setInterval(() => {
-                    if (this.floodWait.active && this.floodWait.remaining > 0) {
-                        this.floodWait.remaining = Math.max(0, this.floodWait.remaining - 1);
-                    }
-                }, 1000);
-                // Throttle elapsed: no local ticker, rely on server value
-                // (poll runs every 1.5s, server returns accurate elapsed)
+                // FloodWait countdown: server poll (1s) is the single source
+                // of truth — it already refreshes every second, so a local
+                // ticker decrementing the same field makes the countdown
+                // jump 2s per second (double-writer bug). Local ticker removed.
                 // Pending list refreshes every 5 seconds
                 // 9-23 fix: 增量轮询（不带 reset）——reset 会清空已加载的
                 // 分页内容导致列表不停闪烁、永远只显示第一页

@@ -1336,17 +1336,31 @@ async def worker(client: pyrogram.client.Client):
                     clear_task_heartbeat(composite_key)
             except Exception as e:
                 logger.exception(f"Worker exception for task {getattr(node, 'task_id_display', '?')}: {e}")
-                # ConnectionError 说明 client 已 stopped，先尝试重连+重试
+                # 9-24 扩展网络识别：Connection lost(OSError)/TimeoutError/
+                # CancelledError(get_messages 超时被 wait_for 取消)/Client
+                # 未启动——全是断网期恢复路径外逃的典型。此前只认两个字符串，
+                # TimeoutError/OSError 直接漏到判死（0916-1122/1123 根因）
                 error_str = str(e)
-                if "Client has not been started" in error_str or "ConnectionError" in error_str:
+                _worker_is_net = (
+                    "Client has not been started" in error_str
+                    or "ConnectionError" in error_str
+                    or isinstance(e, (ConnectionError, TimeoutError, OSError))
+                    or "Connection lost" in error_str
+                    or "timed out" in error_str.lower()
+                    or "timeout" in error_str.lower()
+                    or isinstance(e, asyncio.CancelledError)
+                )
+                if _worker_is_net:
                     _client_conn_errors["count"] += 3
                     reconnect_ok = await _maybe_reconnect_client(force=True)
-                    retry_count = _watchdog_retry_count.get(node.task_id, 0)
-                    if reconnect_ok and retry_count < _MAX_WATCHDOG_RETRIES:
-                        _watchdog_retry_count[node.task_id] = retry_count + 1
+                    # 9-24 用户确认：网络类 Worker 异常不设重试预算——
+                    # 重连成功即 requeue（断点 .temp 保留），失败则 sleep
+                    # 后原地重入队，永不判死（对齐"网络类只退避不预算"）
+                    if reconnect_ok:
+                        _watchdog_retry_count.pop(node.task_id, None)
                         logger.info(
                             f"Worker: requeue task {node.task_id_display} "
-                            f"(retry {retry_count + 1}/{_MAX_WATCHDOG_RETRIES}) after exception + reconnect"
+                            f"after network exception + reconnect"
                         )
                         await _reset_task_for_retry(node, message)
                         clear_task_heartbeat(f"{node.chat_id}_{message.id}" if message else "")
@@ -1356,7 +1370,21 @@ async def worker(client: pyrogram.client.Client):
                             await queue.put((message, node))
                         _requeued = True
                         continue
-                # 移到失败列表
+                    # 重连失败：退避后原地重试（任务不离开 worker，不判死）
+                    logger.warning(
+                        f"Worker: reconnect failed for {node.task_id_display}, "
+                        f"backoff 60s then requeue (temp preserved, NOT failing)"
+                    )
+                    await _reset_task_for_retry(node, message)
+                    clear_task_heartbeat(f"{node.chat_id}_{message.id}" if message else "")
+                    node.total_task = 1
+                    node.is_running = True
+                    await asyncio.sleep(60)
+                    if message:
+                        await queue.put((message, node))
+                    _requeued = True
+                    continue
+                # 非网络异常（真逻辑错误）→ 判死进失败列表
                 _move_task_to_failed(node, message, f"Worker异常: {error_str[:80]}")
             finally:
                 # 并发计数 -1。9-23 批次3：requeue 分支也必须 -1。
