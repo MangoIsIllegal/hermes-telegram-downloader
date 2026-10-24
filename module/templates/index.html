@@ -1667,9 +1667,9 @@
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
                     </svg>
-                    <span x-show="pendingTasks.length > 0"
+                    <span x-show="pendingTotal > 0"
                           class="absolute -top-1 -right-3 pulse-badge text-[10px] font-bold bg-amber-500 text-white rounded-full min-w-[16px] h-4 flex items-center justify-center px-1"
-                          x-text="pendingTasks.length"></span>
+                          x-text="pendingTotal"></span>
                 </span>
                 <span class="text-[10px] font-medium">待下载</span>
             </button>

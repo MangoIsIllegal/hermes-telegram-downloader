@@ -25,6 +25,36 @@ _total_download_size: int = 0
 _last_download_time: float = time.time()
 _download_state: DownloadState = DownloadState.Downloading
 _paused_tasks: set = set()
+
+# 10-24：暂停状态持久化——暂停是用户明确意图，容器重启丢失会导致
+# 已暂停任务在重启后悄悄恢复下载（且重启后任务回到 pending，用户
+# 未必盯得到）。存 log/paused_tasks.json，启动时恢复。
+_PAUSED_TASKS_FILE = os.path.join(os.path.abspath("."), "log", "paused_tasks.json")
+
+
+def _load_paused_tasks():
+    """启动时从磁盘恢复暂停集合。"""
+    try:
+        if os.path.exists(_PAUSED_TASKS_FILE):
+            with open(_PAUSED_TASKS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                _paused_tasks.update(str(x) for x in data)
+    except Exception:
+        pass  # 损坏文件不阻塞启动，等价于无暂停任务
+
+
+def _save_paused_tasks():
+    """暂停集合落盘（pause/resume 时调用）。"""
+    try:
+        os.makedirs(os.path.dirname(_PAUSED_TASKS_FILE), exist_ok=True)
+        with open(_PAUSED_TASKS_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(_paused_tasks), f, ensure_ascii=False, indent=0)
+    except Exception:
+        pass
+
+
+_load_paused_tasks()
 _cancelled_tasks: set = set()
 _failed_downloads: list = []
 _chat_titles: dict = {}  # chat_id -> chat_title mapping
@@ -138,6 +168,7 @@ def get_task_heartbeat_age(composite_key: str) -> float:
 def pause_task(task_id) -> bool:
     """Pause a specific download task by task_id"""
     _paused_tasks.add(str(task_id))
+    _save_paused_tasks()
     return True
 
 
@@ -146,6 +177,7 @@ def resume_task(task_id) -> bool:
     task_id_str = str(task_id)
     if task_id_str in _paused_tasks:
         _paused_tasks.discard(task_id_str)
+        _save_paused_tasks()
         return True
     return False
 
@@ -331,6 +363,9 @@ async def update_download_status(
         _reset_task_speed(composite_key)
         _check_and_reset_global_speed()
         await asyncio.sleep(1)
+        # 10-24：暂停期间持续 touch 心跳——zombie watchdog 以心跳为唯一
+        # 存活信号，暂停任务不 touch 会被 30min zombie 误杀
+        _task_heartbeat[composite_key] = time.time()
 
     while get_download_state() == DownloadState.StopDownload:
         if node.is_stop_transmission:

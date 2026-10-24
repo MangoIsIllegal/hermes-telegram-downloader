@@ -15,6 +15,7 @@ from module.app import Application, ChatDownloadConfig, DownloadStatus, TaskNode
 from module.bot import start_download_bot, stop_download_bot
 from module.download_stat import load_downloads, save_downloads, set_chat_title, update_download_status
 from module.download_stat import add_failed_download as _add_failed_download
+from module.download_stat import touch_task_heartbeat
 from module.task_store import update_task_progress, update_download_state
 from module.get_chat_history_v2 import get_chat_history_v2
 from module.language import _t
@@ -487,16 +488,39 @@ def _move_task_to_failed(node, message, error_message):
         pass
 
 
+async def _heartbeat_sleep(seconds: float, composite_key: str):
+    """分段 sleep 并周期 touch 心跳——dl_task 内部所有长等待统一走这里。
+
+    10-24 修复：zombie watchdog 以心跳为唯一存活信号（cf92719 降级后
+    唯一兜底）。退避/FloodWait 长等待若不 touch，心跳停在上一个成功
+    chunk，30 分钟后必被 zombie 误杀。分段 30s touch = "协程还活着"
+    信号；真挂死（无回调无等待推进）不会有任何 touch。
+    """
+    from module.download_stat import touch_task_heartbeat
+    _waited = 0.0
+    while _waited < seconds:
+        _chunk = min(30.0, seconds - _waited)
+        await asyncio.sleep(_chunk)
+        _waited += _chunk
+        try:
+            touch_task_heartbeat(composite_key)
+        except Exception:
+            pass
+
+
 async def _reset_task_for_retry(node, message):
     """重置 node 状态，准备重新入队下载。"""
     from module.pyrogram_extension import remove_download_cache
-    from module.download_stat import delete_download_result_entry as _ddre
     import time as _time
     # 清理 download_cache，防止 record_download_status 装饰器短路返回 Downloading
     # Cache 对象没有 .pop()，用 remove_download_cache 操作 .store 内部 dict
     remove_download_cache(node.chat_id, message.id)
-    # 清理 _download_result placeholder
-    _ddre(node.chat_id, message.id)
+    # 10-24 修复：不再删除 _download_result placeholder。旧逻辑 requeue 后
+    # 若下载挂在启动阶段（无任何进度回调），placeholder 永不重建 → 任务
+    # 从 Active 列表消失 + Pending 列表因 state=downloading 也排除 →
+    # UI 三处全不可见（1012-198 个案：暂停的任务凭空消失）。
+    # 保留条目：requeue 期间显示冻结进度（速度归 0），重挑后回调覆盖。
+    # 最终失败路径 _move_task_to_failed 仍会删除条目。
     # 重置 node 状态
     node.total_task = 0
     node.total_download_task = 0
@@ -644,6 +668,8 @@ async def download_media(
     media_size = 0
     _media = None
     error_message = ""  # Track specific error reason
+    # 心跳 key：与 update_download_status / worker watchdog 一致
+    composite_key = f"{node.chat_id}_{message.id}" if message else ""
     # Skip the initial fetch_message — the pending consumer already called
     # get_messages seconds ago, so the file reference is fresh. The extra
     # get_messages call here was causing indefinite blocks when TG rate-limits
@@ -806,7 +832,7 @@ async def download_media(
                             _unified_flood_wait["reason"] = (
                                 f"续传 FloodWait (msg {message.id})"
                             )
-                            await asyncio.sleep(_fw)
+                            await _heartbeat_sleep(_fw, composite_key)
                             retry -= 1
                             continue
                         _backoff = min(15 * (2 ** (_net_retry - 1)), 600)
@@ -816,10 +842,9 @@ async def download_media(
                             f"backoff {_backoff}s (does NOT consume download retries)"
                         )
                         error_message = f"续传网络错误，退避{_backoff}秒"
-                        # 9-24 watchdog 降级后：退避等待不再需要 touch 心跳
-                        # 防误杀（watchdog 不再因无心跳 cancel），心跳回归
-                        # 纯"下载进度"语义
-                        await asyncio.sleep(_backoff)
+                        # 10-24：分段 touch 心跳（zombie 30min 兜底以心跳为
+                        # 唯一存活信号，长退避不 touch 会被误杀）
+                        await _heartbeat_sleep(_backoff, composite_key)
                         retry -= 1  # while 循环：本轮不消耗下载重试
                         continue
                     error_message = f"续传失败: {str(resume_err)[:60]}"
@@ -992,7 +1017,7 @@ async def download_media(
                     await node.bot.send_message(int(node.from_user_id), notify_text)
                 except Exception:
                     pass
-            await asyncio.sleep(wait_err.value)
+            await _heartbeat_sleep(wait_err.value, composite_key)
             logger.info("Message[{}]: FlowWait {}s, waiting (total={}s)", message.id, wait_err.value, total_wait)
             error_message = f"频率限制，等待{wait_err.value}秒"
             _check_timeout(retry, message.id)
@@ -1045,7 +1070,7 @@ async def download_media(
                     await node.bot.send_message(int(node.from_user_id), notify_text)
                 except Exception:
                     pass
-            await asyncio.sleep(backoff)
+            await _heartbeat_sleep(backoff, composite_key)
             # 刷新消息引用（可能已过期），用 try-except 防止二次超时
             try:
                 message = await fetch_message(client, message)
@@ -1078,7 +1103,7 @@ async def download_media(
                 f"retry {retry + 1}/3 after {backoff}s backoff"
             )
             error_message = f"连接错误: {str(e)[:80]}"
-            await asyncio.sleep(backoff)
+            await _heartbeat_sleep(backoff, composite_key)
             message = await fetch_message(client, message)
             if message is None:
                 logger.error(f"Message[{message_id}] {ui_file_name}: fetch_message returned None after connection error")
@@ -1242,6 +1267,15 @@ async def worker(client: pyrogram.client.Client):
 
                 target_client = node.client if node.client else client
                 composite_key = f"{node.chat_id}_{message.id}"
+                # 10-24 修复：pickup 即 seed 心跳。旧逻辑心跳只由进度回调
+                # 设置——挂在启动阶段的任务（requeue 后无任何回调）心跳
+                # 永远不存在，watchdog `age<0: continue` 形成永久盲区
+                # （1012-198 挂死 57 分钟零告警）。seed 后 age 从 0 计，
+                # 启动挂死 30min 也会被 zombie 兜底抓住。
+                try:
+                    touch_task_heartbeat(composite_key)
+                except Exception:
+                    pass
 
                 # 用 Task 包裹 download_task，配合心跳 watchdog（9-24 降级版）
                 dl_task = asyncio.create_task(
