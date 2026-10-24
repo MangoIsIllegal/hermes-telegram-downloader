@@ -1298,9 +1298,7 @@ async def worker(client: pyrogram.client.Client):
                         if dl_task.done():
                             break
                         age = get_task_heartbeat_age(composite_key)
-                        # 心跳不存在(age=-1) = 任务还在启动/退避前段，不算异常
-                        if age < 0:
-                            continue
+                        # pickup 已 seed 心跳，age 恒 >= 0；无 -1 分支
                         if age > _TASK_HEARTBEAT_TIMEOUT:
                             now = time.time()
                             # 告警限频 5 分钟一条，S1 静默限速期间持续可见
