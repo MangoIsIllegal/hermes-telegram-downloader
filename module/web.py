@@ -119,12 +119,13 @@ def get_download_speed():
 def get_flood_wait():
     """Get unified FloodWait cooldown status for WebUI display."""
     from module.pyrogram_extension import is_flood_wait_active, get_flood_wait_remaining, _unified_flood_wait
-    from module.download_stat import _throttle_state
+    from module.download_stat import _throttle_state, has_active_download
     import time as _now
     now = _now.time()
-    # throttle active 直接看 notified — 只要没解除限速就一直显示
-    # docker 重启后 _throttle_state 重置为默认值，自动清除
-    throttle_active = _throttle_state["notified"]
+    # throttle active = notified 且当前确有任务在真实下载（10-25）：
+    # 暂停全部/全部完成时进度回调停发，解除路径不会跑，单看 notified
+    # 会无限滞留（横幅挂 3h+ 而实际什么都没下载）
+    throttle_active = _throttle_state["notified"] and has_active_download()
     throttle_elapsed = int(now - _throttle_state["since"]) if _throttle_state["since"] > 0 else 0
     return jsonify(
         active=is_flood_wait_active(),

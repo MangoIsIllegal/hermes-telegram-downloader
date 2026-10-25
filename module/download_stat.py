@@ -83,6 +83,47 @@ _SLOW_THRESHOLD_BPS = 200 * 1024   # 200 KB/s
 _SLOW_SUSTAIN_SEC = 120            # 持续 120 秒触发
 _SLOW_CLEAR_SUSTAIN_SEC = 15       # 速度恢复持续 15 秒才解除
 
+def has_active_download() -> bool:
+    """是否存在真实在跑的下载任务（非暂停/非取消，0<已下<总量）。
+
+    10-25：静默限速横幅的显示闸——全部暂停/全部完成时，进度回调
+    停发导致"速度恢复15s"解除路径永远不会跑，notified/since 滞留，
+    横幅无限计时。读侧必须以"有无真实下载"为准。
+    """
+    try:
+        for _cid, _msgs in list(_download_result.items()):
+            for _mid, _val in list(_msgs.items()):
+                _total = _val.get("total_size", 0)
+                _down = _val.get("down_byte", 0)
+                if _total > 0 and 0 < _down < _total:
+                    _ckey = f"{_cid}_{_mid}"
+                    if is_task_paused(_ckey) or is_task_paused(_val.get("task_id", "")):
+                        continue
+                    if str(_val.get("task_id", "")) in _cancelled_tasks:
+                        continue
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+def _maybe_reset_throttle_if_idle():
+    """无活跃下载任务时清空静默限速状态机（10-25）。
+
+    暂停全部/全部完成/全局停止期间没有进度回调，"速度恢复15s"解除
+    路径永远不会跑，notified/since 永久滞留（横幅无限计时）；且不清
+    since 的话，恢复下载第一秒就会拿旧 since 立刻重新判定+重发通知。
+    在暂停等待循环/全局停止循环里每秒调用，代价可忽略。
+    """
+    if not _throttle_state["notified"] and _throttle_state["since"] == 0:
+        return
+    if has_active_download():
+        return
+    _throttle_state["notified"] = False
+    _throttle_state["since"] = 0
+    _throttle_state["recovery_since"] = 0.0
+
+
 # Helper: asyncio.Lock can't be used from sync contexts; provide a try-lock wrapper
 # for sync functions that are also called from async context.
 # Strategy: sync functions that read/write shared state use a reentrant-compatible
@@ -366,11 +407,15 @@ async def update_download_status(
         # 10-24：暂停期间持续 touch 心跳——zombie watchdog 以心跳为唯一
         # 存活信号，暂停任务不 touch 会被 30min zombie 误杀
         _task_heartbeat[composite_key] = time.time()
+        # 10-25：全部暂停/无活跃下载时清空静默限速状态机（横幅滞留修复）
+        _maybe_reset_throttle_if_idle()
 
     while get_download_state() == DownloadState.StopDownload:
         if node.is_stop_transmission:
             client.stop_transmission()
         await asyncio.sleep(1)
+        # 10-25：全局停止同样清空静默限速状态机
+        _maybe_reset_throttle_if_idle()
 
     # 更新进度心跳 — worker watchdog 用这个检测死连接
     _task_heartbeat[composite_key] = cur_time
