@@ -206,10 +206,24 @@ def get_task_heartbeat_age(composite_key: str) -> float:
     return time.time() - ts
 
 
+def _reset_throttle_state():
+    """清空静默限速状态机（10-27）。
+
+    暂停/恢复是保证执行的同步点（不依赖 chunk 到达触发回调）。
+    10-25 的清空挂在回调暂停循环里，静默限速长空窗期回调可能
+    一次都不跑 → 旧 since 滞留，恢复第一秒横幅带旧时长瞬跳。
+    恢复下载后若真被限速，重新观察 120s 才再判定。
+    """
+    _throttle_state["notified"] = False
+    _throttle_state["since"] = 0
+    _throttle_state["recovery_since"] = 0.0
+
+
 def pause_task(task_id) -> bool:
     """Pause a specific download task by task_id"""
     _paused_tasks.add(str(task_id))
     _save_paused_tasks()
+    _reset_throttle_state()
     return True
 
 
@@ -219,6 +233,7 @@ def resume_task(task_id) -> bool:
     if task_id_str in _paused_tasks:
         _paused_tasks.discard(task_id_str)
         _save_paused_tasks()
+        _reset_throttle_state()
         return True
     return False
 
