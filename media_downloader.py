@@ -102,6 +102,8 @@ def _worker_pool_set_target(n: int):
     if n > cur:
         # 扩容：补足差额。注意：本函数可能从 Flask 线程调用（无 running loop），
         # 必须把 create_task 调度到 pyrogram 主 event loop 上执行
+        # 11-10：重置缩容信号，避免历史哨兵误杀；计数只由 worker() 入口/退出维护
+        _worker_exit_signal = False
         import asyncio as _aio
         added = 0
         client = _main_client_ref.get("client")
@@ -114,8 +116,6 @@ def _worker_pool_set_target(n: int):
                     fut.result(timeout=10)
                 else:
                     _aio.get_running_loop().create_task(worker(client))
-                with _worker_pool_lock:
-                    _live_workers += 1
                 added += 1
             except Exception as e:
                 logger.error(
@@ -1247,8 +1247,8 @@ async def worker(client: pyrogram.client.Client):
                     with _worker_pool_lock:
                         target = max(1, getattr(app, "max_download_task", 2))
                         if _worker_exit_signal and _live_workers > target:
-                            _live_workers -= 1
-                            logger.info(f"Worker exiting (pool scale-down, live={_live_workers})")
+                            # 11-10：计数 -1 统一由函数末尾 finally 执行，此处不再手减
+                            logger.info("Worker exiting (pool scale-down)")
                             return
                         # 非多余 worker：忽略哨兵，继续工作
                     continue
@@ -1936,10 +1936,8 @@ def main():
         _MAX_WORKERS = max(1, getattr(app, 'max_download_task', 2))
         logger.info(f"Starting {_MAX_WORKERS} workers (max_download_task={_MAX_WORKERS})")
         with _worker_pool_lock:
-            _live_workers = 0  # 重置计数（main 只在启动时跑一次）
+            _live_workers = 0  # 重置计数；存活数由 worker() 入口/退出唯一维护（11-10）
         for _ in range(_MAX_WORKERS):
-            with _worker_pool_lock:
-                _live_workers += 1
             tasks.append(app.loop.create_task(worker(client)))
         # 9-24 S1+ 静默限速重启器（方案改动 3）
         tasks.append(app.loop.create_task(_throttle_restart_loop(client)))
