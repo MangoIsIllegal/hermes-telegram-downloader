@@ -1239,6 +1239,11 @@ async def worker(client: pyrogram.client.Client):
     try:
         while app.is_running:
             global _active_downloads
+            # 11-10：本迭代是否真正取到任务。哨兵(None)/异常退出不得动并发计数——
+            # 此前 try 包住了 queue.get()，finally 无条件 -1：每放一个缩容哨兵
+            # 就白扣 1，计数变负后 bot.py 并发护栏（active+in_queue+consuming
+            # >= max 才拦）永远放行，待下载任务被无限塞进队列（占位卡堆积）。
+            _counted = False
             try:
                 logger.info(f"Worker waiting for queue item...")
                 item = await queue.get()
@@ -1255,6 +1260,7 @@ async def worker(client: pyrogram.client.Client):
                 message = item[0]
                 node: TaskNode = item[1]
                 _active_downloads += 1  # 并发计数 +1
+                _counted = True
                 logger.info(f"Worker picked up message {message.id} from chat {node.chat_id} for task {node.task_id_display} (active={_active_downloads})")
                 _requeued = False  # 保留变量供 requeue 分支标记（不再影响计数，见 finally）
                 # Mark task as actively downloading (no longer pending/in-queue)
@@ -1425,7 +1431,8 @@ async def worker(client: pyrogram.client.Client):
                 # 占 2 个计数（22:53 事故 active=4 > max=3 的铁证），
                 # watchdog 每循环一轮泄漏 +1，最终守卫被泄漏值误拦。
                 # 任务在队列中的占用由守卫公式的 in_queue 项计入。
-                _active_downloads -= 1
+                if _counted:  # 11-10：仅真实取到任务的迭代才归还计数
+                    _active_downloads -= 1
     finally:
         with _worker_pool_lock:
             _live_workers -= 1
